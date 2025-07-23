@@ -30,6 +30,7 @@ class Trainer(ParallelWorkerBase):
     running a client-side agent fleet.
 
     Attributes:
+        dev: If True, rollouts are run against the dev endpoint provided in `fit`.
         n_workers: Number of agent workers (processes) to run in parallel.
         max_tasks: Maximum number of tasks to process per worker. If None,
                    workers run until no more tasks are available.
@@ -45,16 +46,18 @@ class Trainer(ParallelWorkerBase):
     def __init__(
         self,
         *,
+        dev: bool = False,
         n_workers: int = 1,
         max_tasks: Optional[int] = None,
         daemon: bool = True,
         tracer: Union[BaseTracer, str, dict, None] = None,
-        triplet_exporter: Union[TripletExporter, dict, None] = None
+        triplet_exporter: Union[TripletExporter, dict, None] = None,
     ):
         super().__init__()
         self.n_workers = n_workers
         self.max_tasks = max_tasks
         self.daemon = daemon
+        self.dev = dev
         self._client: AgentLightningClient | None = None  # Will be initialized in fit method
 
         self.tracer = self._make_tracer(tracer)
@@ -101,10 +104,10 @@ class Trainer(ParallelWorkerBase):
             )
         raise ValueError(f"Invalid tracer type: {type(tracer)}. Expected BaseTracer, str, dict, or None.")
 
-    def init(self, endpoint: str) -> None:
+    def init(self, backend: Union[str, AgentLightningClient]) -> None:
         logger.info(f"Initializing Trainer...")
 
-        self._init_client(endpoint)
+        self._init_client(backend)
 
         self.tracer.init()
 
@@ -114,7 +117,7 @@ class Trainer(ParallelWorkerBase):
         logger.info(f"Cleaning up Trainer...")
         self.tracer.teardown()
 
-        self._verl_client = None
+        self._client = None
         logger.info(f"Trainer main cleanup complete.")
 
     def client(self) -> AgentLightningClient:
@@ -123,9 +126,19 @@ class Trainer(ParallelWorkerBase):
             raise RuntimeError("AgentLightningClient has not been initialized. Call `init` first.")
         return self._client
 
-    def _init_client(self, endpoint: str) -> AgentLightningClient:
+    def _init_client(self, backend: Union[str, AgentLightningClient]) -> AgentLightningClient:
         if self._client is None:
-            self._client = AgentLightningClient(endpoint=endpoint)
+            if isinstance(backend, AgentLightningClient):
+                logger.info("Using provided AgentLightningClient instance.")
+                self._client = backend
+            else:
+                logger.info(f"Initializing AgentLightningClient with endpoint: {backend}")
+                if not isinstance(backend, str):
+                    raise ValueError("backend must be a string URL or an AgentLightningClient instance.")
+                if not backend.startswith("http://") and not backend.startswith("https://"):
+                    raise ValueError("backend must be a valid URL starting with http:// or https://")
+                # Initialize the client with the provided backend URL
+                self._client = AgentLightningClient(endpoint=backend)
         else:
             logger.warning("AgentLightningClient already initialized. Returning existing instance.")
         return self._client
@@ -202,8 +215,16 @@ class Trainer(ParallelWorkerBase):
             if proc.name().startswith("AgentLightning-"):
                 proc.kill()
 
-    def fit(self, agent: LitAgent, endpoint: str) -> None:
-        self.init(endpoint)
+    def fit(self, agent: LitAgent, backend: Union[str, AgentLightningClient], dev_backend: Union[str, AgentLightningClient, None] = None):
+        if self.dev:
+            if dev_backend is None:
+                raise ValueError("dev_backend must be provided when dev=True.")
+            logger.warning(f"Running in dev mode. Using dev backend: {dev_backend}")
+            self.init(dev_backend)
+        else:
+            logger.debug(f"Running in non-dev mode. Using backend: {backend}")
+            self.init(backend)
+
         processes: List[multiprocessing.Process] = []
 
         # Determine if the agent is asynchronous.
