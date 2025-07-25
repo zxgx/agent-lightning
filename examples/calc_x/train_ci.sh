@@ -1,7 +1,6 @@
-
 #!/bin/bash
 
-set -e
+set -ex
 
 export N_GPUS=1
 export BASE_MODEL=Qwen/Qwen2.5-1.5B-Instruct
@@ -9,6 +8,8 @@ export DATA_DIR=data
 export ROLLOUT_TP_SIZE=1
 export EXPERIMENT_NAME="calc_x_$(date +%Y%m%d%H%M%S)"
 export PROJECT_NAME=AgentLightningCI
+echo "project_name=${PROJECT_NAME}" >> $GITHUB_OUTPUT
+echo "run_name=${EXPERIMENT_NAME}" >> $GITHUB_OUTPUT
 
 PYTHONUNBUFFERED=1 python -m agentlightning.verl \
     algorithm.adv_estimator=grpo \
@@ -48,6 +49,6 @@ PYTHONUNBUFFERED=1 python -m agentlightning.verl \
     trainer.experiment_name=${EXPERIMENT_NAME} \
     trainer.nnodes=1 \
     trainer.save_freq=256 \
-    trainer.test_freq=3 \
+    trainer.test_freq=6 \
     trainer.total_epochs=1 \
-    trainer.total_training_steps=3 $@
+    trainer.total_training_steps=6 $@

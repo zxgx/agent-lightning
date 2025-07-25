@@ -1,17 +1,17 @@
 #!/bin/bash
 
-set -e
+set -ex
 
 export N_GPUS=1
 export BASE_MODEL=Qwen/Qwen2.5-Coder-1.5B-Instruct
 export DATA_DIR=data
 export ROLLOUT_TP_SIZE=1
 export EXPERIMENT_NAME="spider_$(date +%Y%m%d%H%M%S)"
-export PROJECT_NAME=AgentLightning
+export PROJECT_NAME=AgentLightningCI
+echo "project_name=${PROJECT_NAME}" >> $GITHUB_OUTPUT
+echo "run_name=${EXPERIMENT_NAME}" >> $GITHUB_OUTPUT
 
-echo "Starting training script..."
-
-python -m agentlightning.verl \
+PYTHONUNBUFFERED=1 python -m agentlightning.verl \
     agentlightning.port=9991 \
     algorithm.adv_estimator=grpo \
     data.train_files=${DATA_DIR}/train_spider.parquet \
