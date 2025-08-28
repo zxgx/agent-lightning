@@ -278,7 +278,10 @@ class AgentLightningTrainer(RayPPOTrainer):
             self.config.agentlightning.port,
             self.config.actor_rollout_ref.rollout.n,
             train_information={
-                "model": self.config.actor_rollout_ref.model.path,
+                # Note (Zhiyuan): To avoid further patch into vllm async server, using the same sentence to get the naming here.
+                # However, it is possible that verl updates the naming and causes incompatibility.
+                # Reference: https://github.com/volcengine/verl/blob/5b5e09d9cc20625e436d01f69d9cc739ff681c54/verl/workers/rollout/vllm_rollout/vllm_async_server.py#L217
+                "model": "/".join(self.config.actor_rollout_ref.model.path.split("/")[-2:]),
                 "temperature": self.config.actor_rollout_ref.rollout.temperature,
             },
             tokenizer=self.tokenizer,
