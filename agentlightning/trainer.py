@@ -8,13 +8,13 @@ import signal
 import time
 from typing import List, Optional, Union
 import importlib
-
-import agentops
+import warnings
 
 from .client import AgentLightningClient
 from .litagent import LitAgent
 from .runner import AgentRunner
-from .types import ParallelWorkerBase
+from .types import Dataset, ParallelWorkerBase
+from .algorithm.base import BaseAlgorithm
 from .tracer.base import BaseTracer
 from .tracer.agentops import AgentOpsTracer
 from .tracer.triplet import TripletExporter
@@ -43,6 +43,7 @@ class Trainer(ParallelWorkerBase):
                 If None, a default `AgentOpsTracer` will be created with the current settings.
         triplet_exporter: An instance of `TripletExporter` to export triplets from traces,
                           or a dictionary with the initialization parameters for the exporter.
+        algorithm: An instance of `BaseAlgorithm` to use for training.
     """
 
     def __init__(
@@ -54,6 +55,7 @@ class Trainer(ParallelWorkerBase):
         daemon: bool = True,
         tracer: Union[BaseTracer, str, dict, None] = None,
         triplet_exporter: Union[TripletExporter, dict, None] = None,
+        algorithm: Union[BaseAlgorithm, str, dict, None] = None,
     ):
         super().__init__()
         self.n_workers = n_workers
@@ -73,6 +75,8 @@ class Trainer(ParallelWorkerBase):
             raise ValueError(
                 f"Invalid triplet_exporter type: {type(triplet_exporter)}. Expected TripletExporter, dict, or None."
             )
+
+        self.algorithm = self._make_algorithm(algorithm)
 
         if not self.daemon:
             logger.warning(
@@ -103,6 +107,73 @@ class Trainer(ParallelWorkerBase):
         if tracer is None:
             return AgentOpsTracer(agentops_managed=True, instrument_managed=True, daemon=self.daemon)
         raise ValueError(f"Invalid tracer type: {type(tracer)}. Expected BaseTracer, str, dict, or None.")
+
+    def _make_algorithm(self, algorithm: Union[BaseAlgorithm, str, dict, None]) -> Optional[BaseAlgorithm]:
+        """Creates an algorithm instance based on the provided configuration."""
+        if isinstance(algorithm, BaseAlgorithm):
+            return algorithm
+        if isinstance(algorithm, str):
+            module_name, class_name = algorithm.rsplit(".", 1)
+            module = importlib.import_module(module_name)
+            algorithm_cls = getattr(module, class_name)
+            return algorithm_cls()
+        if isinstance(algorithm, dict):
+            algorithm_type = algorithm.get("type")
+            if algorithm_type is None:
+                raise ValueError("algorithm dict must have a 'type' key with the class full name")
+            module_name, class_name = algorithm_type.rsplit(".", 1)
+            module = importlib.import_module(module_name)
+            algorithm_cls = getattr(module, class_name)
+            # Remove 'type' key and pass remaining keys as kwargs
+            algorithm_kwargs = {k: v for k, v in algorithm.items() if k != "type"}
+            return algorithm_cls(**algorithm_kwargs)
+        if algorithm is None:
+            return None
+        raise ValueError(f"Invalid algorithm type: {type(algorithm)}. Expected BaseAlgorithm, str, dict, or None.")
+
+    def _extract_client_from_data(
+        self, data: Union[str, AgentLightningClient, Dataset]
+    ) -> Optional[AgentLightningClient]:
+        """Extract client from data if it's a string URL or AgentLightningClient."""
+        if isinstance(data, str):
+            if not data.startswith("http://") and not data.startswith("https://"):
+                raise ValueError("String data must be a valid URL starting with http:// or https://")
+            return AgentLightningClient(endpoint=data)
+        elif isinstance(data, AgentLightningClient):
+            return data
+        return None
+
+    def _extract_dataset_from_data(self, data: Union[str, AgentLightningClient, Dataset]) -> Optional[Dataset]:
+        """Extract dataset from data if it's a Dataset."""
+        if isinstance(data, str) or isinstance(data, AgentLightningClient):
+            return None
+        return data
+
+    def _determine_backend(
+        self,
+        train_data: Union[str, AgentLightningClient, Dataset],
+        dev_data: Union[str, AgentLightningClient, Dataset, None] = None,
+    ) -> Union[str, AgentLightningClient]:
+        """Determine which backend to use for initialization."""
+        if self.dev:
+            if dev_data is None:
+                raise ValueError("dev_data must be provided when dev=True.")
+            client = self._extract_client_from_data(dev_data)
+            if client is None:
+                raise ValueError("dev_data must be a string URL or AgentLightningClient when dev=True.")
+            return client
+        else:
+            client = self._extract_client_from_data(train_data)
+            if client is None and self.algorithm is None:
+                raise ValueError(
+                    "train_data must be a string URL or AgentLightningClient when no algorithm is provided."
+                )
+            elif client is None and self.algorithm is not None:
+                # Algorithm will be responsible for creating the client
+                client = self.algorithm.get_client()
+                logger.info(f"Algorithm created client: {client}")
+                return client
+            return client
 
     def init(self, backend: Union[str, AgentLightningClient]) -> None:
         logger.info(f"Initializing Trainer...")
@@ -218,43 +289,107 @@ class Trainer(ParallelWorkerBase):
             if proc.name().startswith("AgentLightning-"):
                 proc.kill()
 
+    def _terminate_processes(self, processes: List[multiprocessing.Process]) -> None:
+        if self.n_workers > 1 and len(processes) > 0:
+            for i, p in enumerate(processes):
+                if p.is_alive():
+                    logger.info(f"Terminating worker {i} (name: {p.name}, PID: {p.pid})...")
+                    p.terminate()
+                else:
+                    logger.info(f"Worker {i} (name: {p.name}, PID: {p.pid}) is not alive or has already terminated.")
+            for i, p in enumerate(processes):
+                if p.is_alive():
+                    p.join(timeout=10)  # Give some time to terminate
+                if p.is_alive():  # If still alive, kill
+                    logger.warning(
+                        f"Worker {i} (name: {p.name}, PID: {p.pid}) did not terminate gracefully, killing..."
+                    )
+                    p.kill()
+                    p.join(timeout=10)  # Ensure it's reaped
+
     def fit(
         self,
         agent: LitAgent,
-        backend: Union[str, AgentLightningClient],
+        train_data: Union[str, AgentLightningClient, Dataset],
+        *,
+        val_data: Union[str, AgentLightningClient, Dataset, None] = None,
+        dev_data: Union[str, AgentLightningClient, Dataset, None] = None,
         dev_backend: Union[str, AgentLightningClient, None] = None,
     ):
+        """Train the agent using the provided data.
+
+        Each data argument can be a string URL connecting to a agent-lightning server,
+        or an AgentLightningClient instance connecting to a server (or mock server), or a dataset.
+        If no algorithm is provided when instantiating the trainer, the data must be
+        provided to connecting a server. Otherwise, dataset is also allowed and will be
+        passed to the algorithm.
+
+        If the algorithm is instantiated and there is no URL/client provided,
+        the algorithm will be responsible for creating a client that will connect to itself.
+        It can also create a mock client if the algorithm does not require a server.
+        """
+
+        if dev_backend is not None:
+            warnings.warn("dev_backend is deprecated. Use dev_data instead.")
+            if dev_data is not None:
+                raise ValueError("dev_data and dev_backend cannot be provided at the same time.")
+            dev_data = dev_backend
+
+        # Extract datasets for algorithm if available
+        train_dataset = self._extract_dataset_from_data(train_data)
+        val_dataset = self._extract_dataset_from_data(val_data) if val_data else None
+        dev_dataset = self._extract_dataset_from_data(dev_data) if dev_data else None
+
+        # Initialize the algorithm with trainer if provided
+        if self.algorithm is not None:
+            self.algorithm.set_trainer(self)
+            # DO NOT RUN TRAINING HERE. Need to spawn the worker first.
+
+        # Determine the backend to use for client-server mode
+        backend = self._determine_backend(train_data, dev_data)
+
         if self.dev:
-            if dev_backend is None:
-                raise ValueError("dev_backend must be provided when dev=True.")
-            logger.warning(f"Running in dev mode. Using dev backend: {dev_backend}")
-            self.init(dev_backend)
+            logger.warning(f"Running in dev mode. Using dev backend: {backend}")
         else:
             logger.debug(f"Running in non-dev mode. Using backend: {backend}")
-            self.init(backend)
+
+        self.init(backend)
 
         processes: List[multiprocessing.Process] = []
 
-        # Determine if the agent is asynchronous.
-        is_async = (
-            hasattr(agent, "training_rollout_async")
-            and agent.__class__.training_rollout_async is not LitAgent.training_rollout_async
-        )
+        # Determine if the agent is asynchronous
 
-        mode = "asynchronous" if is_async else "synchronous"
+        mode = "asynchronous" if agent.is_async else "synchronous"
 
         try:
             if self.n_workers == 1:
                 logger.info(f"Running with n_workers=1 ({mode} in main process).")
-                num_tasks = self._worker_main_loop(agent, 0, is_async)
+
+                # Warn if algorithm is set with single worker mode
+                if self.algorithm is not None:
+                    logger.warning(
+                        "Algorithm is set but using single worker mode. Algorithm will never get the chance to run."
+                    )
+                    # Ideally the single worker should be run in a separate thread or process.
+
+                num_tasks = self._worker_main_loop(agent, 0, agent.is_async)
                 logger.info(f"Single worker mode finished. Tasks processed: {num_tasks}")
+
+                # If algorithm is provided and we have datasets, run algorithm after worker completes
+                if self.algorithm is not None and train_dataset is not None:
+                    logger.info("Running algorithm training after worker completion.")
+                    self.algorithm.run(
+                        train_dataset=train_dataset,
+                        validation_dataset=val_dataset,
+                        dev_dataset=dev_dataset,
+                    )
             else:
                 logger.info(f"Running with n_workers={self.n_workers} ({mode} multiprocessing).")
                 for i in range(self.n_workers):
                     process_name = f"AgentLightning-Worker-{i}"
                     p = multiprocessing.Process(
                         target=self._worker_main_loop,
-                        args=(agent, i, is_async),
+                        args=(agent, i, agent.is_async),
                         daemon=self.daemon,
                         name=process_name,
                     )
@@ -263,6 +398,17 @@ class Trainer(ParallelWorkerBase):
                     p.start()
 
                 if self.daemon:
+                    # If algorithm is provided and we have datasets, pass them to the algorithm
+                    if self.algorithm is not None:
+                        logger.info("All workers have been spawned. Running algorithm training with provided datasets.")
+                        self.algorithm.run(
+                            train_dataset=train_dataset,
+                            validation_dataset=val_dataset,
+                            dev_dataset=dev_dataset,
+                        )
+                        logger.info("Algorithm exits. Killing the workers.")
+                        self._terminate_processes(processes)
+
                     for i, p in enumerate(processes):
                         p.join()  # Wait for the process to complete
                         logger.info(
@@ -283,29 +429,26 @@ class Trainer(ParallelWorkerBase):
 
                     multiprocessing_process._children.clear()  # type: ignore
 
+                    if self.algorithm is not None:
+                        logger.info("Main process continues to run algorithm.")
+                        self.algorithm.run(
+                            train_dataset=train_dataset,
+                            validation_dataset=val_dataset,
+                            dev_dataset=dev_dataset,
+                        )
+                        logger.info("Algorithm exits. Killing the workers.")
+                        self._terminate_processes(processes)
+
         except KeyboardInterrupt:
-            if self.n_workers > 1 and len(processes) > 0:
-                logger.info(f"KeyboardInterrupt received. Terminating workers...")
-                for i, p in enumerate(processes):
-                    if p.is_alive():
-                        logger.info(f"Terminating worker {i} (name: {p.name}, PID: {p.pid})...")
-                        p.terminate()
-                    else:
-                        logger.info(
-                            f"Worker {i} (name: {p.name}, PID: {p.pid}) is not alive or has already terminated."
-                        )
-                for i, p in enumerate(processes):
-                    if p.is_alive():
-                        p.join(timeout=10)  # Give some time to terminate
-                    if p.is_alive():  # If still alive, kill
-                        logger.warning(
-                            f"Worker {i} (name: {p.name}, PID: {p.pid}) did not terminate gracefully, killing..."
-                        )
-                        p.kill()
-                        p.join(timeout=10)  # Ensure it's reaped
+            logger.info("KeyboardInterrupt received. Killing the workers.")
+            self._terminate_processes(processes)
             logger.info(f"Workers terminated or single worker interrupted.")
+            raise
         except Exception as e:
             logger.exception(f"Unhandled exception in fit method.")
+            self._terminate_processes(processes)
+            logger.info(f"Workers terminated or single worker interrupted.")
+            raise
         finally:
             if self.daemon:
                 self.teardown()
