@@ -1,6 +1,5 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-#!/usr/bin/env python3
 """
 Functional tests for HttpTracer with real HTTP requests.
 
@@ -8,8 +7,6 @@ These tests use actual HTTP requests to httpbingo.org to validate
 that the HttpTracer correctly captures HTTP traffic in both
 normal and subprocess modes.
 """
-
-import asyncio
 
 import aiohttp
 import pytest
@@ -68,6 +65,7 @@ def test_normal_mode_sync_requests():
 
     # Verify span attributes
     for span in spans:
+        assert span.attributes is not None
         assert "http.method" in span.attributes
         assert "http.url" in span.attributes
         assert "http.status_code" in span.attributes
@@ -155,6 +153,7 @@ def test_span_attributes_detailed():
 
     for span in spans:
         # Basic HTTP attributes
+        assert span.attributes is not None
         assert "http.method" in span.attributes
         assert "http.url" in span.attributes
         assert "http.target" in span.attributes
@@ -182,6 +181,7 @@ def test_span_attributes_minimal():
 
     for span in spans:
         # Basic HTTP attributes should still be present
+        assert span.attributes is not None
         assert "http.method" in span.attributes
         assert "http.url" in span.attributes
         assert "http.status_code" in span.attributes
