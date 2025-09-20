@@ -11,6 +11,8 @@ from pydantic import BaseModel
 
 from agentlightning.types import Triplet
 
+from .base import TraceAdapter
+
 
 class Transition(BaseModel):
     """
@@ -510,9 +512,9 @@ class TraceTree:
         )
 
 
-class TripletExporter:
+class TraceTripletAdapter(TraceAdapter[List[Triplet]]):
     """
-    A class to export triplet data from OpenTelemetry spans.
+    An adapter to convert OpenTelemetry spans to triplet data.
 
     Attributes:
         repair_hierarchy: When `repair_hierarchy` is set to True, the trace will be repaired with the time information.
@@ -537,9 +539,9 @@ class TripletExporter:
         self.exclude_llm_call_in_reward = exclude_llm_call_in_reward
         self.reward_match = reward_match
 
-    def export(self, spans: List[ReadableSpan]) -> List[Triplet]:
+    def adapt(self, source: List[ReadableSpan], /) -> List[Triplet]:
         """Convert OpenTelemetry spans to a list of Triplet objects."""
-        trace_tree = TraceTree.from_spans(spans)
+        trace_tree = TraceTree.from_spans(source)
         if self.repair_hierarchy:
             trace_tree.repair_hierarchy()
         trajectory = trace_tree.to_trajectory(
