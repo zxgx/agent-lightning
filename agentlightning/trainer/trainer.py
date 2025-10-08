@@ -1,26 +1,39 @@
 # Copyright (c) Microsoft. All rights reserved.
 
 import asyncio
-import importlib
+import functools
+import inspect
 import logging
 import multiprocessing
 import signal
 import time
 import warnings
-from typing import Any, Dict, List, Optional, TypeVar, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
-from .adapter import TraceTripletAdapter
-from .algorithm.base import BaseAlgorithm
-from .client import AgentLightningClient
-from .litagent import LitAgent
-from .runner import AgentRunner
-from .tracer.agentops import AgentOpsTracer
-from .tracer.base import BaseTracer
-from .types import Dataset, ParallelWorkerBase
+from agentlightning.adapter import TraceTripletAdapter
+from agentlightning.algorithm.base import BaseAlgorithm
+from agentlightning.client import AgentLightningClient
+from agentlightning.execution.base import ExecutionStrategy
+from agentlightning.execution.client_server import ClientServerExecutionStrategy
+from agentlightning.execution.events import Event
+from agentlightning.litagent import LitAgent
+from agentlightning.llm_proxy import LLMProxy
+from agentlightning.runner import AgentRunner, AgentRunnerV2, BaseRunner
+from agentlightning.store.base import LightningStore
+from agentlightning.store.memory import InMemoryLightningStore
+from agentlightning.tracer.agentops import AgentOpsTracer
+from agentlightning.tracer.base import BaseTracer
+from agentlightning.types import Dataset, Hook, ParallelWorkerBase
+
+from .init_utils import build_component, instantiate_component
+from .registry import ExecutionStrategyRegistry
 
 logger = logging.getLogger(__name__)
 
 T_co = TypeVar("T_co", covariant=True)
+T = TypeVar("T")
+
+ComponentSpec = Union[T, type[T], Callable[[], T], str, Dict[str, Any], None]
 
 
 class Trainer(ParallelWorkerBase):
@@ -32,51 +45,124 @@ class Trainer(ParallelWorkerBase):
     running a client-side agent fleet.
 
     Attributes:
+        algorithm: An instance of `BaseAlgorithm` to use for training.
+        store: An instance of `LightningStore` to use for storing tasks and traces.
+        runner: An instance of `BaseRunner` to use for running the agent.
         dev: If True, rollouts are run against the dev endpoint provided in `fit`.
-        n_workers: Number of agent workers (processes) to run in parallel.
-        max_tasks: Maximum number of tasks to process per worker. If None,
-                   workers run until no more tasks are available.
-        daemon: Whether worker processes should be daemons. Daemon processes
-                are terminated automatically when the main process exits.
+        n_runners: Number of agent runners to run in parallel.
+        max_rollouts: Maximum number of rollouts to process per runner. If None,
+                      workers run until no more rollouts are available.
+        strategy: An instance of `ExecutionStrategy` to use for spawning the algorithm and runners.
         tracer: A tracer instance, or a string pointing to the class full name or a dictionary with a 'type' key
                 that specifies the class full name and other initialization parameters.
                 If None, a default `AgentOpsTracer` will be created with the current settings.
+        hooks: A sequence of `Hook` instances to be called at various lifecycle stages (e.g., on_trace_start,
+               on_trace_end, on_rollout_start, on_rollout_end).
+        adapter: An instance of `TraceTripletAdapter` to export data consumble by algorithms from traces.
+        llm_proxy: An instance of `LLMProxy` to use for intercepting the LLM calls.
+                   If not provided, algorithm will create one on its own.
+        n_workers: Number of agent workers to run in parallel. Deprecated in favor of `n_runners`.
+        max_tasks: Maximum number of tasks to process per runner. Deprecated in favor of `max_rollouts`.
+        daemon: Whether worker processes should be daemons. Daemon processes
+                are terminated automatically when the main process exits. Deprecated.
+                Only have effect with `fit_v0`.
         triplet_exporter: An instance of `TraceTripletAdapter` to export triplets from traces,
                           or a dictionary with the initialization parameters for the exporter.
-        algorithm: An instance of `BaseAlgorithm` to use for training.
+                          Deprecated. Use `adapter` instead.
     """
 
     def __init__(
         self,
         *,
         dev: bool = False,
-        n_workers: int = 1,
+        n_runners: Optional[int] = None,
+        max_rollouts: Optional[int] = None,
+        tracer: ComponentSpec[BaseTracer] = None,
+        adapter: ComponentSpec[TraceTripletAdapter] = None,
+        store: ComponentSpec[LightningStore] = None,
+        runner: ComponentSpec[BaseRunner[Any]] = None,
+        strategy: ComponentSpec[ExecutionStrategy] = None,
+        algorithm: ComponentSpec[BaseAlgorithm] = None,
+        llm_proxy: ComponentSpec[LLMProxy] = None,
+        n_workers: Optional[int] = None,
         max_tasks: Optional[int] = None,
         daemon: bool = True,
-        tracer: Union[BaseTracer, str, Dict[str, Any], None] = None,
-        triplet_exporter: Union[TraceTripletAdapter, Dict[str, Any], None] = None,
-        algorithm: Union[BaseAlgorithm, str, Dict[str, Any], None] = None,
+        triplet_exporter: ComponentSpec[TraceTripletAdapter] = None,
+        hooks: Optional[Union[Hook, Sequence[Hook]]] = None,
     ):
         super().__init__()
-        self.n_workers = n_workers
-        self.max_tasks = max_tasks
-        self.daemon = daemon
         self.dev = dev
-        self._client: AgentLightningClient | None = None  # Will be initialized in fit method
+        self.daemon = daemon
+        self._client: AgentLightningClient | None = None  # Will be initialized in fit or fit_v0
 
-        self.tracer = self._make_tracer(tracer)
-        if isinstance(triplet_exporter, TraceTripletAdapter):
-            self.triplet_exporter = triplet_exporter
-        elif isinstance(triplet_exporter, dict):
-            self.triplet_exporter = TraceTripletAdapter(**triplet_exporter)
-        elif triplet_exporter is None:
-            self.triplet_exporter = TraceTripletAdapter()
-        else:
-            raise ValueError(
-                f"Invalid triplet_exporter type: {type(triplet_exporter)}. Expected TraceTripletAdapter, dict, or None."
+        if n_workers is not None:
+            warnings.warn(
+                "`n_workers` is deprecated. Please use `n_runners`.",
+                DeprecationWarning,
+                stacklevel=2,
             )
 
+        if n_runners is None:
+            n_runners = n_workers if n_workers is not None else 1
+        else:
+            if n_workers is not None and n_workers != n_runners:
+                warnings.warn(
+                    "`n_workers` is ignored when `n_runners` is provided.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+
+        self.n_runners = n_runners
+        self.n_workers = n_runners  # Backwards compatibility for fit_v0
+
+        if max_tasks is not None:
+            warnings.warn(
+                "`max_tasks` is deprecated. Please use `max_rollouts`.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        if max_rollouts is None:
+            max_rollouts = max_tasks
+        elif max_tasks is not None and max_tasks != max_rollouts:
+            warnings.warn(
+                "`max_tasks` is ignored when `max_rollouts` is provided.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        self.max_rollouts = max_rollouts
+        self.max_tasks = max_tasks if max_tasks is not None else max_rollouts
+
+        self.tracer = self._make_tracer(tracer)
+
+        if adapter is not None and triplet_exporter is not None:
+            warnings.warn(
+                "`triplet_exporter` is deprecated and ignored because `adapter` is provided.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        adapter_spec = adapter if adapter is not None else triplet_exporter
+        self.adapter = self._make_adapter(adapter_spec)
+        self.triplet_exporter = self.adapter  # Backwards compatibility
+
         self.algorithm = self._make_algorithm(algorithm)
+
+        # The active store for the current execution context
+        self.store = self._make_store(store)
+        self.runner = self._make_runner(runner)
+
+        self.strategy = self._make_strategy(strategy, n_runners=self.n_runners)
+        if hasattr(self.strategy, "n_runners"):
+            strategy_runners = getattr(self.strategy, "n_runners")
+            if isinstance(strategy_runners, int) and strategy_runners > 0:
+                self.n_runners = strategy_runners
+                self.n_workers = strategy_runners
+
+        self.llm_proxy = self._make_llm_proxy(llm_proxy, store=self.store)
+
+        self.hooks = self._normalize_hooks(hooks)
 
         if not self.daemon:
             logger.warning(
@@ -85,51 +171,216 @@ class Trainer(ParallelWorkerBase):
                 "The cleanup must be handled manually."
             )
 
-    def _make_tracer(self, tracer: Union[BaseTracer, str, Dict[str, Any], None]) -> BaseTracer:
+    def _make_tracer(self, tracer: ComponentSpec[BaseTracer]) -> BaseTracer:
         """Creates a tracer instance based on the provided configuration."""
-        if isinstance(tracer, BaseTracer):
-            return tracer
-        if isinstance(tracer, str):
-            module_name, class_name = tracer.rsplit(".", 1)
-            module = importlib.import_module(module_name)
-            tracer_cls = getattr(module, class_name)
-            return tracer_cls()
-        if isinstance(tracer, dict):
-            tracer_type = tracer.get("type")
-            if tracer_type is None:
-                raise ValueError("tracer dict must have a 'type' key with the class full name")
-            module_name, class_name = tracer_type.rsplit(".", 1)
-            module = importlib.import_module(module_name)
-            tracer_cls = getattr(module, class_name)
-            # Remove 'type' key and pass remaining keys as kwargs
-            tracer_kwargs = {k: v for k, v in tracer.items() if k != "type"}
-            return tracer_cls(**tracer_kwargs)
-        if tracer is None:
-            return AgentOpsTracer(agentops_managed=True, instrument_managed=True, daemon=self.daemon)
-        raise ValueError(f"Invalid tracer type: {type(tracer)}. Expected BaseTracer, str, dict, or None.")
+        default_factory = lambda: AgentOpsTracer(
+            agentops_managed=True,
+            instrument_managed=True,
+            daemon=self.daemon,
+        )
+        return build_component(
+            tracer,
+            expected_type=BaseTracer,
+            spec_name="tracer",
+            default_factory=default_factory,
+            dict_requires_type=True,
+            invalid_spec_error_fmt="Invalid tracer type: {actual_type}. Expected BaseTracer, str, dict, or None.",
+            type_error_fmt="Tracer factory returned {type_name}, which is not a BaseTracer subclass.",
+        )
 
-    def _make_algorithm(self, algorithm: Union[BaseAlgorithm, str, Dict[str, Any], None]) -> Optional[BaseAlgorithm]:
+    def _make_algorithm(self, algorithm: ComponentSpec[BaseAlgorithm]) -> Optional[BaseAlgorithm]:
         """Creates an algorithm instance based on the provided configuration."""
-        if isinstance(algorithm, BaseAlgorithm):
-            return algorithm
-        if isinstance(algorithm, str):
-            module_name, class_name = algorithm.rsplit(".", 1)
-            module = importlib.import_module(module_name)
-            algorithm_cls = getattr(module, class_name)
-            return algorithm_cls()
-        if isinstance(algorithm, dict):
-            algorithm_type = algorithm.get("type")
-            if algorithm_type is None:
-                raise ValueError("algorithm dict must have a 'type' key with the class full name")
-            module_name, class_name = algorithm_type.rsplit(".", 1)
-            module = importlib.import_module(module_name)
-            algorithm_cls = getattr(module, class_name)
-            # Remove 'type' key and pass remaining keys as kwargs
-            algorithm_kwargs = {k: v for k, v in algorithm.items() if k != "type"}
-            return algorithm_cls(**algorithm_kwargs)
-        if algorithm is None:
-            return None
-        raise ValueError(f"Invalid algorithm type: {type(algorithm)}. Expected BaseAlgorithm, str, dict, or None.")
+        return build_component(
+            algorithm,
+            expected_type=BaseAlgorithm,
+            spec_name="algorithm",
+            allow_none=True,
+            invalid_spec_error_fmt="Invalid algorithm type: {actual_type}. Expected BaseAlgorithm, str, dict, or None.",
+            type_error_fmt="Algorithm factory returned {type_name}, which is not a BaseAlgorithm subclass.",
+        )
+
+    def _make_adapter(self, adapter: ComponentSpec[TraceTripletAdapter]) -> TraceTripletAdapter:
+        return build_component(
+            adapter,
+            expected_type=TraceTripletAdapter,
+            spec_name="adapter",
+            default_factory=TraceTripletAdapter,
+            dict_requires_type=False,
+            dict_default_cls=TraceTripletAdapter,
+            invalid_spec_error_fmt="Invalid adapter type: {actual_type}. Expected TraceTripletAdapter, dict, or None.",
+            type_error_fmt="Adapter factory returned {type_name}, which is not a TraceTripletAdapter subclass.",
+        )
+
+    def _make_store(self, store: ComponentSpec[LightningStore]) -> LightningStore:
+        return build_component(
+            store,
+            expected_type=LightningStore,
+            spec_name="store",
+            default_factory=InMemoryLightningStore,
+            invalid_spec_error_fmt="Invalid store type: {actual_type}. Expected LightningStore, str, dict, or None.",
+            type_error_fmt="Store factory returned {type_name}, which is not a LightningStore subclass.",
+        )
+
+    def _make_strategy(
+        self,
+        strategy: ComponentSpec[ExecutionStrategy],
+        *,
+        n_runners: int,
+    ) -> ExecutionStrategy:
+        if isinstance(strategy, ExecutionStrategy):
+            return strategy
+        optional_defaults: Dict[str, Callable[[], Any]] = {"n_runners": lambda: n_runners}
+
+        def default_factory() -> ExecutionStrategy:
+            return ClientServerExecutionStrategy(n_runners=n_runners, role="both")
+
+        return build_component(
+            strategy,
+            expected_type=ExecutionStrategy,
+            spec_name="strategy",
+            default_factory=default_factory,
+            optional_defaults=optional_defaults,
+            invalid_spec_error_fmt="Invalid strategy type: {actual_type}. Expected ExecutionStrategy, str, dict, or None.",
+            type_error_fmt="Strategy factory returned {type_name}, which is not an ExecutionStrategy subclass.",
+            registry=ExecutionStrategyRegistry,
+        )
+
+    def _make_llm_proxy(
+        self,
+        llm_proxy: ComponentSpec[LLMProxy],
+        *,
+        store: LightningStore,
+    ) -> Optional[LLMProxy]:
+        if isinstance(llm_proxy, LLMProxy):
+            return llm_proxy
+
+        optional_defaults: Dict[str, Callable[[], Any]] = {"store": lambda: store}
+        if isinstance(llm_proxy, dict):
+            llm_proxy = {**llm_proxy}
+            llm_proxy.setdefault("store", store)
+
+        return build_component(
+            llm_proxy,
+            expected_type=LLMProxy,
+            spec_name="llm_proxy",
+            allow_none=True,
+            optional_defaults=optional_defaults,
+            invalid_spec_error_fmt="Invalid llm_proxy type: {actual_type}. Expected LLMProxy, dict, str, or None.",
+            type_error_fmt="llm_proxy factory returned {type_name}, which is not an LLMProxy subclass.",
+        )
+
+    def _make_runner(self, runner: ComponentSpec[BaseRunner[Any]]) -> BaseRunner[Any]:
+        optional_defaults: Dict[str, Callable[[], Any]] = {"tracer": lambda: self.tracer}
+        if self.max_rollouts is not None:
+            optional_defaults["max_rollouts"] = lambda: self.max_rollouts
+
+        def default_runner_factory() -> BaseRunner[Any]:
+            return instantiate_component(AgentRunnerV2, optional_defaults=optional_defaults)
+
+        return build_component(
+            runner,
+            expected_type=BaseRunner,
+            spec_name="runner",
+            default_factory=default_runner_factory,
+            optional_defaults=optional_defaults,
+            invalid_spec_error_fmt="Invalid runner type: {actual_type}. Expected BaseRunner, callable, str, dict, or None.",
+            type_error_fmt="Runner factory returned {type_name}, which is not a BaseRunner subclass.",
+        )
+
+    def _normalize_hooks(self, hooks: Optional[Union[Hook, Sequence[Hook]]]) -> Sequence[Hook]:
+        if hooks is None:
+            return ()
+        if isinstance(hooks, Hook):
+            return (hooks,)
+        return tuple(hooks)
+
+    def fit_v2(
+        self,
+        agent: LitAgent[T_co],
+        train_dataset: Optional[Dataset[T_co]] = None,
+        *,
+        val_dataset: Optional[Dataset[T_co]] = None,
+        dev_dataset: Optional[Dataset[T_co]] = None,
+    ) -> None:
+        """Run the training loop using the configured strategy, store, and runner."""
+        agent.set_trainer(self)
+
+        algorithm_bundle = functools.partial(
+            self._algorithm_bundle,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            dev_dataset=dev_dataset,
+        )
+        runner_bundle = functools.partial(self._runner_bundle, agent=agent)
+
+        self.strategy.execute(algorithm_bundle, runner_bundle, self.store)
+
+    async def _algorithm_bundle(
+        self,
+        store: LightningStore,
+        event: Event,
+        train_dataset: Optional[Dataset[T_co]],
+        val_dataset: Optional[Dataset[T_co]],
+        dev_dataset: Optional[Dataset[T_co]],
+    ) -> None:
+        if self.algorithm is not None:
+            self.algorithm.set_trainer(self)
+            self.algorithm.set_store(store)
+            self.algorithm.set_adapter(self.adapter)
+            if self.llm_proxy is not None:
+                self.llm_proxy.set_store(store)
+                self.algorithm.set_llm_proxy(self.llm_proxy)
+
+        if self.algorithm is None:
+            while not event.is_set():
+                await asyncio.sleep(0.1)
+            return
+        try:
+            if inspect.iscoroutinefunction(self.algorithm.run):
+                await self.algorithm.run(
+                    train_dataset=train_dataset,
+                    val_dataset=val_dataset,
+                    dev_dataset=dev_dataset,
+                )
+            else:
+                # This will block the event loop to maximize the debugging experience
+                # It's the responsibility of the execution strategy to enable async execution
+                self.algorithm.run(
+                    train_dataset=train_dataset,
+                    val_dataset=val_dataset,
+                    dev_dataset=dev_dataset,
+                )
+        except Exception:
+            logger.exception("Algorithm bundle encountered an error.")
+            raise
+
+    async def _runner_bundle(self, store: LightningStore, worker_id: int, event: Event, agent: LitAgent[T_co]) -> None:
+        runner_instance: BaseRunner[Any] | None = None
+        runner_initialized = False
+        worker_initialized = False
+        try:
+            # If not using shm execution strategy, we are already in the forked process
+            runner_instance = self.runner
+            runner_instance.init(agent=agent, hooks=self.hooks)
+            runner_initialized = True
+            runner_instance.init_worker(worker_id, store)
+            worker_initialized = True
+            await runner_instance.iter(event=event)
+        except Exception:
+            logger.exception("Runner bundle encountered an error (worker_id=%s).", worker_id)
+            raise
+        finally:
+            if runner_instance is not None:
+                if worker_initialized:
+                    try:
+                        runner_instance.teardown_worker(worker_id)
+                    except Exception:
+                        logger.exception("Error during runner worker teardown (worker_id=%s).", worker_id)
+                if runner_initialized:
+                    try:
+                        runner_instance.teardown()
+                    except Exception:
+                        logger.exception("Error during runner teardown (worker_id=%s).", worker_id)
 
     def _extract_client_from_data(
         self, data: Union[str, AgentLightningClient, Dataset[Any]]
@@ -386,7 +637,7 @@ class Trainer(ParallelWorkerBase):
                     logger.info("Running algorithm training after worker completion.")
                     self.algorithm.run(
                         train_dataset=train_dataset,
-                        validation_dataset=val_dataset,
+                        val_dataset=val_dataset,
                         dev_dataset=dev_dataset,
                     )
             else:
@@ -409,7 +660,7 @@ class Trainer(ParallelWorkerBase):
                         logger.info("All workers have been spawned. Running algorithm training with provided datasets.")
                         self.algorithm.run(
                             train_dataset=train_dataset,
-                            validation_dataset=val_dataset,
+                            val_dataset=val_dataset,
                             dev_dataset=dev_dataset,
                         )
                         logger.info("Algorithm exits. Killing the workers.")
@@ -439,7 +690,7 @@ class Trainer(ParallelWorkerBase):
                         logger.info("Main process continues to run algorithm.")
                         self.algorithm.run(
                             train_dataset=train_dataset,
-                            validation_dataset=val_dataset,
+                            val_dataset=val_dataset,
                             dev_dataset=dev_dataset,
                         )
                         logger.info("Algorithm exits. Killing the workers.")

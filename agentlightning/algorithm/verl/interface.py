@@ -8,7 +8,7 @@ from omegaconf import OmegaConf
 from agentlightning.algorithm.base import BaseAlgorithm
 from agentlightning.client import AgentLightningClient
 from agentlightning.types import Dataset
-from agentlightning.verl.entrypoint import run_ppo
+from agentlightning.verl.entrypoint import run_ppo  # type: ignore
 
 
 class VERL(BaseAlgorithm):
@@ -26,12 +26,36 @@ class VERL(BaseAlgorithm):
     def run(
         self,
         train_dataset: Optional[Dataset[Any]] = None,
-        validation_dataset: Optional[Dataset[Any]] = None,
+        val_dataset: Optional[Dataset[Any]] = None,
         dev_dataset: Optional[Dataset[Any]] = None,
     ) -> None:
         if dev_dataset is not None:
             raise ValueError("dev_dataset is not supported for VERL.")
-        run_ppo(self.config, train_dataset, validation_dataset)
+
+        try:
+            store = self.store
+        except Exception:
+            print("Store is not set. Assuming v0 execution mode.")
+            run_ppo(
+                self.config,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                store=None,
+                llm_proxy=None,
+                adapter=None,
+            )
+        else:
+            print("Store is set. Assuming v1 execution mode.")
+            llm_proxy = self.llm_proxy
+            adapter = self.adapter
+            run_ppo(
+                self.config,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                store=store,
+                llm_proxy=llm_proxy,
+                adapter=adapter,
+            )
 
     def get_client(self) -> AgentLightningClient:
         port = self.config.agentlightning.port

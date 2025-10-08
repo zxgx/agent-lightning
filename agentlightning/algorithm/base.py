@@ -5,10 +5,13 @@ from __future__ import annotations
 import weakref
 from typing import TYPE_CHECKING, Any, Optional
 
+from agentlightning.adapter import TraceAdapter
 from agentlightning.client import AgentLightningClient
+from agentlightning.store.base import LightningStore
 from agentlightning.types import Dataset
 
 if TYPE_CHECKING:
+    from agentlightning.llm_proxy import LLMProxy
     from agentlightning.trainer import Trainer
 
 
@@ -16,6 +19,9 @@ class BaseAlgorithm:
     """Algorithm is the strategy, or tuner to train the agent."""
 
     _trainer_ref: weakref.ReferenceType[Trainer] | None = None
+    _llm_proxy_ref: weakref.ReferenceType["LLMProxy"] | None = None
+    _store: LightningStore | None = None
+    _adapter_ref: weakref.ReferenceType[TraceAdapter[Any]] | None = None
 
     def set_trainer(self, trainer: Trainer) -> None:
         """
@@ -41,13 +47,75 @@ class BaseAlgorithm:
             raise ValueError("Trainer reference is no longer valid (object has been garbage collected).")
         return trainer
 
+    def set_llm_proxy(self, llm_proxy: LLMProxy | None) -> None:
+        """
+        Set the LLM proxy for this algorithm to reuse when available.
+
+        Args:
+            llm_proxy: The LLMProxy instance configured by the trainer, if any.
+        """
+        self._llm_proxy_ref = weakref.ref(llm_proxy) if llm_proxy is not None else None
+
+    @property
+    def llm_proxy(self) -> Optional[LLMProxy]:
+        """
+        Retrieve the configured LLM proxy instance, if one has been set.
+
+        Returns:
+            The active LLMProxy instance or None when not configured.
+        """
+        if self._llm_proxy_ref is None:
+            return None
+
+        llm_proxy = self._llm_proxy_ref()
+        if llm_proxy is None:
+            raise ValueError("LLM proxy reference is no longer valid (object has been garbage collected).")
+
+        return llm_proxy
+
+    def set_adapter(self, adapter: TraceAdapter[Any]) -> None:
+        """
+        Set the adapter for this algorithm to collect and convert traces.
+        """
+        self._adapter_ref = weakref.ref(adapter)
+
+    @property
+    def adapter(self) -> TraceAdapter[Any]:
+        """
+        Retrieve the adapter for this algorithm to communicate with the runners.
+        """
+        if self._adapter_ref is None:
+            raise ValueError("Adapter has not been set for this algorithm.")
+        adapter = self._adapter_ref()
+        if adapter is None:
+            raise ValueError("Adapter reference is no longer valid (object has been garbage collected).")
+        return adapter
+
+    def set_store(self, store: LightningStore) -> None:
+        """
+        Set the store for this algorithm to communicate with the runners.
+
+        Store is set directly instead of using weakref because its copy is meant to be
+        maintained throughout the algorithm's lifecycle.
+        """
+        self._store = store
+
+    @property
+    def store(self) -> LightningStore:
+        """
+        Retrieve the store for this algorithm to communicate with the runners.
+        """
+        if self._store is None:
+            raise ValueError("Store has not been set for this algorithm.")
+        return self._store
+
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.run(*args, **kwargs)
 
     def run(
         self,
         train_dataset: Optional[Dataset[Any]] = None,
-        validation_dataset: Optional[Dataset[Any]] = None,
+        val_dataset: Optional[Dataset[Any]] = None,
         dev_dataset: Optional[Dataset[Any]] = None,
     ) -> None:
         """Subclasses should implement this method to implement the algorithm.
@@ -67,33 +135,9 @@ class BaseAlgorithm:
         If the algorithm does not require a server-client communication, it can also create a mock client
         that never communicates with itself.
 
+        Deprecated and will be removed in a future version.
+
         Returns:
             The AgentLightningClient instance associated with this algorithm.
         """
         raise NotImplementedError("Subclasses must implement get_client().")
-
-    def fit(
-        self,
-        agent: Any,
-        train_data: Optional[Dataset[Any]] = None,
-        test_data: Optional[Dataset[Any]] = None,
-        dev_data: Optional[Dataset[Any]] = None,
-        trainer: Optional[Trainer] = None,
-    ) -> None:
-        """Fit the algorithm with the provided agent and datasets.
-
-        Args:
-            agent: The agent to train.
-            train_data: The training dataset.
-            test_data: The test dataset.
-            dev_data: The development dataset.
-            trainer: The trainer instance.
-        """
-        if trainer is not None:
-            self.set_trainer(trainer)
-
-        self.run(
-            train_dataset=train_data,
-            validation_dataset=test_data,
-            dev_dataset=dev_data,
-        )

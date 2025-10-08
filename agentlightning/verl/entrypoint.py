@@ -9,6 +9,9 @@ import ray
 from verl.trainer.main_ppo import create_rl_sampler
 from verl.trainer.ppo.reward import load_reward_manager
 
+from agentlightning.adapter import TraceAdapter
+from agentlightning.llm_proxy import LLMProxy
+from agentlightning.store.base import LightningStore
 from agentlightning.types import Dataset
 
 from .dataset import AgentDataset, LoadedDataset
@@ -17,10 +20,17 @@ from .trainer import AgentLightningTrainer
 
 @hydra.main(config_path="pkg://agentlightning/verl", config_name="config", version_base=None)
 def main(config):
-    run_ppo(config, None, None)
+    run_ppo(config, train_dataset=None, val_dataset=None, store=None, llm_proxy=None, adapter=None)
 
 
-def run_ppo(config: Any, train_dataset: Dataset[Any] | None, val_dataset: Dataset[Any] | None) -> None:
+def run_ppo(
+    config: Any,
+    train_dataset: Dataset[Any] | None,
+    val_dataset: Dataset[Any] | None,
+    store: LightningStore | None,
+    llm_proxy: LLMProxy | None,
+    adapter: TraceAdapter[Any] | None,
+) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(
@@ -31,12 +41,29 @@ def run_ppo(config: Any, train_dataset: Dataset[Any] | None, val_dataset: Datase
         )
 
     runner = TaskRunner.remote()
-    ray.get(runner.run.remote(config, train_dataset, val_dataset))
+    ray.get(
+        runner.run.remote(
+            config=config,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            store=store,
+            llm_proxy=llm_proxy,
+            adapter=adapter,
+        )
+    )
 
 
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 class TaskRunner:
-    def run(self, config: Any, train_dataset: Dataset | None, val_dataset: Dataset | None):
+    def run(
+        self,
+        config: Any,
+        train_dataset: Dataset | None,
+        val_dataset: Dataset | None,
+        store: LightningStore | None,
+        llm_proxy: LLMProxy | None,
+        adapter: TraceAdapter | None,
+    ):
         # print initial config
         from pprint import pprint
 
@@ -162,6 +189,9 @@ class TaskRunner:
             val_dataset=val_dataset,
             collate_fn=collate_fn,
             train_sampler=train_sampler,
+            store=store,
+            llm_proxy=llm_proxy,
+            adapter=adapter,
         )
         trainer.init_workers()
         trainer.fit()

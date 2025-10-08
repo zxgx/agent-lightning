@@ -2,6 +2,8 @@
 
 # type: ignore
 
+from __future__ import annotations
+
 import random
 from contextlib import contextmanager
 from copy import deepcopy
@@ -31,6 +33,10 @@ from verl.trainer.ppo.ray_trainer import (
 from verl.utils.metric import reduce_metrics
 from verl.utils.tracking import Tracking
 
+from agentlightning.adapter import TraceAdapter, TraceTripletAdapter
+from agentlightning.llm_proxy import LLMProxy
+from agentlightning.store.base import LightningStore
+
 from .daemon import AgentModeDaemon
 
 
@@ -58,6 +64,14 @@ class AgentLightningTrainer(RayPPOTrainer):
     3. Direct batch processing through agent daemon
     4. Streamlined validation using agent_mode validation
     """
+
+    def __init__(
+        self, store: LightningStore | None, llm_proxy: LLMProxy | None, adapter: TraceAdapter | None, **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.store = store
+        self.llm_proxy = llm_proxy
+        self.adapter = adapter
 
     def _validate(self):
         assert len(self.val_dataloader) == 1, "Please set val_batch_size to None for better throughput."
@@ -277,6 +291,8 @@ class AgentLightningTrainer(RayPPOTrainer):
         self._load_checkpoint()
 
         assert self.async_rollout_mode, "If agent mode is enabled, async server must be enabled"
+        if self.adapter is not None and not isinstance(self.adapter, TraceTripletAdapter):
+            raise ValueError("Adapter must be a TraceTripletAdapter for currently VERL implementation.")
         self.agent_mode_daemon = AgentModeDaemon(
             self.config.agentlightning.port,
             self.config.actor_rollout_ref.rollout.n,
@@ -290,6 +306,10 @@ class AgentLightningTrainer(RayPPOTrainer):
             tokenizer=self.tokenizer,
             mini_batch_size=self.config.actor_rollout_ref.actor.ppo_mini_batch_size,
             pad_token_id=self.tokenizer.pad_token_id,
+            mode="v1" if self.store is not None else "v0",
+            store=self.store,
+            llm_proxy=self.llm_proxy,
+            adapter=self.adapter,
         )
         self.agent_mode_daemon.start()
 

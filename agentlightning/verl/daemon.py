@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import requests
@@ -18,6 +18,10 @@ from tensordict import TensorDict
 from verl import DataProto
 
 from agentlightning import LLM, AgentLightningServer, NamedResources, Rollout, configure_logger
+from agentlightning.adapter.triplet import TraceTripletAdapter
+from agentlightning.llm_proxy import LLMProxy, ModelConfig
+from agentlightning.store.base import LightningStore
+from agentlightning.types import RolloutV2, Task
 
 configure_logger()
 
@@ -123,7 +127,7 @@ class AgentModeDaemon:
 
     def __init__(
         self,
-        port: int,
+        port: Optional[int],
         train_rollout_n: int,
         train_information: Dict[str, Any],
         tokenizer: Any,
@@ -131,14 +135,42 @@ class AgentModeDaemon:
         pad_token_id: int,
         reward_fillna_value: float = 0.0,
         llm_timeout_seconds: float = 1200.0,
+        mode: Literal["v0", "v1"] = "v1",
+        llm_proxy: LLMProxy | None = None,
+        store: LightningStore | None = None,
+        adapter: TraceTripletAdapter | None = None,
     ):
+        self.mode = mode
+
         # Server and Task Configuration
-        self.server_port = port
-        self.llm_timeout_seconds = llm_timeout_seconds
-        self.server = AgentLightningServer(
-            host="0.0.0.0", port=self.server_port, task_timeout_seconds=self.llm_timeout_seconds
-        )
-        self.proxy_port = _find_available_port()  # Run proxy on a different port
+        if mode == "v0":
+            assert port is not None
+            self.server_port = port
+            self.llm_timeout_seconds = llm_timeout_seconds
+            self.server = AgentLightningServer(
+                host="0.0.0.0", port=self.server_port, task_timeout_seconds=self.llm_timeout_seconds
+            )
+            self.proxy_port = _find_available_port()  # Run proxy on a different port
+        else:
+            assert store is not None
+            self.store = store
+            if llm_proxy is None:
+                self.llm_proxy = LLMProxy(
+                    port=_find_available_port(),
+                    model_list=[],
+                    store=store,
+                )
+            else:
+                # Reuse the existing LLM proxy (probably configured by user)
+                self.llm_proxy = llm_proxy
+            if adapter is None:
+                self.adapter = TraceTripletAdapter()
+            else:
+                # Reuse the one from trainer
+                self.adapter = adapter
+            self._internal_loop: Optional[asyncio.AbstractEventLoop] = None
+            self._internal_loop_thread = threading.Thread(target=self._internal_loop_runner, daemon=True)
+            self._internal_loop_thread.start()
 
         # Training and Data Configuration
         self.train_rollout_n = train_rollout_n
@@ -151,13 +183,21 @@ class AgentModeDaemon:
         # Internal State
         self.backend_llm_server_addresses: List[str] = []
         self._total_tasks_queued = 0
-        self._completed_rollouts: Dict[str, Rollout] = {}
+        self._completed_rollouts_v0: Dict[str, Rollout] = {}
         self._task_id_to_original_sample: Dict[str, Dict[str, Any]] = {}
         self._server_thread: Optional[threading.Thread] = None
         self._proxy_thread: Optional[threading.Thread] = None
         self.is_train = True
 
-    def _start_proxy_server(self):
+    def _internal_loop_runner(self):
+        """Run the internal loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._internal_loop = loop
+        loop.run_forever()
+        loop.close()
+
+    def _start_proxy_server_v0(self):
         """
         Initializes and runs a Flask-based proxy server in a separate thread.
         This proxy load-balances requests to the actual backend LLM servers.
@@ -247,40 +287,91 @@ class AgentModeDaemon:
         self._proxy_thread.start()
         print(f"Proxy server running on port {self.proxy_port}")
 
+    def _update_proxy_server_v1(self):
+        model_name = self.train_information.get("model")
+        if not model_name:
+            raise ValueError("Model name is not set.")
+        self.llm_proxy.update_model_list(
+            [
+                ModelConfig(
+                    {
+                        "model_name": model_name,
+                        "litellm_params": {
+                            "model": "hosted_vllm/" + model_name,
+                            "api_base": f"http://{address}/v1/",
+                        },
+                    }
+                )
+                for address in self.backend_llm_server_addresses
+            ],
+        )
+
+        if self.llm_proxy.is_running():
+            # FIXME: Need to switch to a different port right now
+            # because the forked processes carried the old fd
+            self.llm_proxy.restart(_port=_find_available_port())
+        else:
+            self.llm_proxy.start()
+
     def start(self):
         """Starts the main AgentLightningServer and the proxy server."""
 
-        def run_server():
-            """Run the AgentLightningServer in a separate thread."""
-            asyncio.run(self.server.run_forever())
+        if self.mode == "v0":
 
-        self._server_thread = threading.Thread(target=run_server, daemon=True)
-        self._server_thread.start()
+            def run_server():
+                """Run the AgentLightningServer in a separate thread."""
+                asyncio.run(self.server.run_forever())
 
-        # Wait for the server's internal startup event to be set.
-        print("Waiting for AgentLightningServer to start...")
-        is_ready = self.server.startup_event.wait(timeout=20.0)  # Wait up to 20s
-        if not is_ready:
-            raise RuntimeError("AgentLightningServer failed to start within the timeout period.")
+            self._server_thread = threading.Thread(target=run_server, daemon=True)
+            self._server_thread.start()
 
-        print(f"AgentLightningServer control plane running on port {self.server_port}")
+            # Wait for the server's internal startup event to be set.
+            print("Waiting for AgentLightningServer to start...")
+            is_ready = self.server.startup_event.wait(timeout=20.0)  # Wait up to 20s
+            if not is_ready:
+                raise RuntimeError("AgentLightningServer failed to start within the timeout period.")
 
-        self._start_proxy_server()
+            print(f"AgentLightningServer control plane running on port {self.server_port}")
+
+            self._start_proxy_server_v0()
+        else:
+            # Agent lightning server is no longer needed;
+            # Start proxy server in _async_set_up
+            pass
 
     async def _async_set_up(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True):
         """Async helper to set up data and resources on the server."""
         self.clear_data_and_server()
-        self.backend_llm_server_addresses = server_addresses
+        if server_addresses != self.backend_llm_server_addresses:
+            self.backend_llm_server_addresses = server_addresses
+            if self.mode == "v1" and not self.llm_proxy.is_running():
+                self._update_proxy_server_v1()
         self.is_train = is_train
 
         # 1. Update resources on the server for clients to use
-        llm_resource = LLM(
-            endpoint=f"http://127.0.0.1:{self.proxy_port}/v1",
-            model=self.train_information.get("model", "default-model"),
-            sampling_parameters={"temperature": self.train_information.get("temperature", 0.7 if is_train else 0.0)},
-        )
+        if self.mode == "v0":
+            llm_resource = LLM(
+                endpoint=f"http://127.0.0.1:{self.proxy_port}/v1",
+                model=self.train_information.get("model", "default-model"),
+                sampling_parameters={
+                    "temperature": self.train_information.get("temperature", 0.7 if is_train else 0.0)
+                },
+            )
+        else:
+            llm_resource = self.llm_proxy.as_resource(
+                sampling_parameters={
+                    "temperature": self.train_information.get("temperature", 0.7 if is_train else 0.0)
+                },
+            )
+
         resources: NamedResources = {"main_llm": llm_resource}
-        resources_id = await self.server.update_resources(resources)
+
+        if self.mode == "v0":
+            resources_id = await self.server.update_resources(resources)
+        else:
+            # This should be replaced with store.add_resources()
+            resources_id = "resource-" + str(uuid.uuid4())
+            await self.store.update_resources(resources_id=resources_id, resources=resources)
 
         # 2. Queue tasks for agents to process
         keys = list(data.keys())
@@ -297,23 +388,40 @@ class AgentModeDaemon:
                 task_metadata = {"data_id": data_id, "is_train": is_train}
 
                 # Data ID is different from Rollout ID, as one data can have multiple rollouts.
-                rollout_id = await self.server.queue_task(
-                    sample=_to_native(original_sample),
-                    mode="train" if is_train else "val",
-                    resources_id=resources_id,
-                    metadata=task_metadata,
-                )
+                if self.mode == "v0":
+                    rollout_id = await self.server.queue_task(
+                        sample=_to_native(original_sample),
+                        mode="train" if is_train else "val",
+                        resources_id=resources_id,
+                        metadata=task_metadata,
+                    )
+                else:
+                    rollout = await self.store.enqueue_rollout(
+                        input=_to_native(original_sample),
+                        mode="train" if is_train else "val",
+                        resources_id=resources_id,
+                        metadata=task_metadata,
+                    )
+                    rollout_id = rollout.rollout_id
+
                 # Store original sample data to reconstruct batch information later
                 self._task_id_to_original_sample[rollout_id] = original_sample
                 self._total_tasks_queued += 1
 
     def set_up_data_and_server(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True):
         """Synchronous wrapper for setting up data and server resources."""
-        if not self.server.loop or not self.server.startup_event.is_set():
-            raise RuntimeError("Server is not running or ready.")
-
         coro = self._async_set_up(data, server_addresses, is_train)
-        future = asyncio.run_coroutine_threadsafe(coro, self.server.loop)
+
+        if self.mode == "v0":
+            if not self.server.loop or not self.server.startup_event.is_set():
+                raise RuntimeError("Server is not running or ready.")
+
+            future = asyncio.run_coroutine_threadsafe(coro, self.server.loop)
+
+        else:
+            if self._internal_loop is None:
+                raise RuntimeError("Internal loop is not running.")
+            future = asyncio.run_coroutine_threadsafe(coro, self._internal_loop)
         try:
             future.result(timeout=60)  # Wait for completion with a timeout
         except Exception as e:
@@ -334,19 +442,80 @@ class AgentModeDaemon:
         elif any(not r.prompt.get("token_ids", []) for r in rollout.triplets):
             print(f"Warning: Rollout {rollout.rollout_id} contains empty prompt: {rollout.triplets}")
 
+    async def _validate_data_v1(self, rollout: RolloutV2) -> Rollout:
+        """Convert RolloutV2 to Rollout and validate.
+
+        1. Task: construct from RolloutV2
+        2. Triplets: obtained by querying spans and feeding into the adapter
+        3. Final reward: extracted from last triplet's reward, searching backwards if not found
+        """
+        # Query spans for this rollout (latest attempt)
+        spans = await self.store.query_spans(rollout.rollout_id, attempt_id="latest")
+
+        # Convert spans to triplets using the adapter
+        if not spans:
+            # No triplets found, will emit a warning later.
+            triplets = []
+        else:
+            triplets = self.adapter.adapt(spans)
+
+        # Extract final reward from triplets
+        final_reward: Optional[float] = None
+        if triplets:
+            # Search backwards through triplets for the first non-None reward
+            for triplet in reversed(triplets):
+                if triplet.reward is not None:
+                    final_reward = triplet.reward
+                    break
+
+        # Construct the Task object from RolloutV2
+        task = Task(
+            rollout_id=rollout.rollout_id,
+            input=rollout.input,
+            mode=rollout.mode,
+            resources_id=rollout.resources_id,
+            metadata=rollout.metadata or {},
+        )
+
+        # Create the Rollout object (without trace and logs as per user's note)
+        result_rollout = Rollout(
+            rollout_id=rollout.rollout_id,
+            task=task,
+            final_reward=final_reward,
+            triplets=triplets,
+            metadata=rollout.metadata or {},
+        )
+
+        # Run the same validation as v0
+        self._validate_data(result_rollout)
+
+        return result_rollout
+
     async def _async_run_until_finished(self, verbose: bool = True):
         """Async helper to wait for all tasks to complete."""
-        while len(self._completed_rollouts) < self._total_tasks_queued:
-            completed_batch = await self.server.retrieve_completed_rollouts()
+        while len(self._completed_rollouts_v0) < self._total_tasks_queued:
+            if self.mode == "v0":
+                completed_batch = await self.server.retrieve_completed_rollouts()
+            else:
+                completed_batch = await self.store.wait_for_rollouts(
+                    rollout_ids=list(self._task_id_to_original_sample.keys()), timeout=0
+                )
             for rollout in completed_batch:
-                self._validate_data(rollout)
+                if rollout.rollout_id in self._completed_rollouts_v0:
+                    # Already processed, skip
+                    continue
+                if isinstance(rollout, RolloutV2):
+                    rollout = await self._validate_data_v1(rollout)
+                else:
+                    self._validate_data(rollout)
                 if rollout.rollout_id not in self._task_id_to_original_sample:
                     print(f"Warning: Received unknown rollout ID {rollout.rollout_id}, skipping.")
                 else:
-                    self._completed_rollouts[rollout.rollout_id] = rollout
+                    self._completed_rollouts_v0[rollout.rollout_id] = rollout
             if verbose:
-                print(f"Completed {len(self._completed_rollouts)}/{self._total_tasks_queued} tasks...")
+                print(f"Completed {len(self._completed_rollouts_v0)}/{self._total_tasks_queued} tasks...")
             await asyncio.sleep(5)
+
         print("All tasks finished.")
 
     def run_until_all_finished(self, verbose: bool = True):
@@ -355,11 +524,16 @@ class AgentModeDaemon:
             print("Warning: No tasks were queued.")
             return
 
-        if not self.server.loop or not self.server.startup_event.is_set():
-            raise RuntimeError("Server is not running or ready.")
+        if self.mode == "v0":
+            if not self.server.loop or not self.server.startup_event.is_set():
+                raise RuntimeError("Server is not running or ready.")
+            loop = self.server.loop
+        else:
+            loop = self._internal_loop
+            assert loop is not None
 
         coro = self._async_run_until_finished(verbose)
-        future = asyncio.run_coroutine_threadsafe(coro, self.server.loop)
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
         try:
             future.result()  # Wait indefinitely for all tasks to complete
         except Exception as e:
@@ -369,10 +543,10 @@ class AgentModeDaemon:
     def get_test_metrics(self):
         """Calculates and returns metrics for a validation run."""
         assert not self.is_train, "This method should only be called during validation."
-        assert len(self._completed_rollouts) == self._total_tasks_queued
+        assert len(self._completed_rollouts_v0) == self._total_tasks_queued
 
         sample_stat_list: List[Dict[str, Any]] = []
-        for _, rollout in self._completed_rollouts.items():
+        for _, rollout in self._completed_rollouts_v0.items():
             final_reward = self._fillna_reward(rollout)
             if not rollout.triplets:
                 print(f"Warning: No triplets found for test rollout {rollout.rollout_id}.")
@@ -409,12 +583,12 @@ class AgentModeDaemon:
         truncation, and tensor creation for the PPO training loop.
         """
         assert self.is_train, "This method should only be called during training."
-        assert len(self._completed_rollouts) == self._total_tasks_queued
+        assert len(self._completed_rollouts_v0) == self._total_tasks_queued
 
         # 1. Reconstruct the `finished_id_to_sample_info` structure from completed rollouts
         finished_id_to_sample_info: Dict[str, Dict[str, Any]] = {}
         finished_id_to_final_reward: Dict[str, float] = {}
-        for rollout_id, rollout in self._completed_rollouts.items():
+        for rollout_id, rollout in self._completed_rollouts_v0.items():
             original_sample = self._task_id_to_original_sample[rollout_id]
 
             final_reward = self._fillna_reward(rollout)
@@ -549,7 +723,7 @@ class AgentModeDaemon:
     def clear_data_and_server(self):
         """Resets the internal state of the daemon for the next run."""
         self.backend_llm_server_addresses = []
-        self._completed_rollouts.clear()
+        self._completed_rollouts_v0.clear()
         self._task_id_to_original_sample.clear()
         self._total_tasks_queued = 0
         # For a true reset, the server's internal queues would also need clearing.
