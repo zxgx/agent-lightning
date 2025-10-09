@@ -93,11 +93,11 @@ def main():
             "n_gpus_per_node": 1,
             "val_before_train": True,
             "critic_warmup": 0,
-            "logger": ["console"],
-            "project_name": "AgentLightningDebug",
-            "experiment_name": "train_verl",
+            "logger": ["console", "wandb"],
+            "project_name": "AgentLightningCI",
+            "experiment_name": "train_verl_v0_2",
             "nnodes": 1,
-            "save_freq": 256,
+            "save_freq": 3,
             "test_freq": 3,
             "total_epochs": 1,
             "total_training_steps": 3,
@@ -112,7 +112,7 @@ def main():
     print("First 5 rows of val dataset:")
     print(val_dataset[:5])  # type: ignore
 
-    trainer = Trainer(algorithm=VERL(rl_training_config), n_workers=2)
+    trainer = Trainer(algorithm=VERL(rl_training_config), n_workers=4)
     trainer.fit_v2(calc_agent, train_dataset, val_dataset=val_dataset)  # type: ignore
 
 
