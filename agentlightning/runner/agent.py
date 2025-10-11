@@ -12,13 +12,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import uuid
 from typing import TYPE_CHECKING, Any, List, Literal, Optional, Sequence, TypeVar, cast
 
 from opentelemetry.sdk.trace import ReadableSpan
 
 from agentlightning.litagent import LitAgent
-from agentlightning.reward import emit_reward, get_last_reward
+from agentlightning.reward import emit_reward, find_final_reward
 from agentlightning.store.base import LightningStore
 from agentlightning.tracer.agentops import AgentOpsTracer
 from agentlightning.tracer.base import BaseTracer
@@ -387,7 +386,7 @@ class AgentRunnerV2(BaseRunner[T_task]):
 
             # Possible exceptions in post_process will be caught in the overall exception handler
             trace_spans = await self._post_process_rollout_result(next_rollout, result)
-            last_reward = get_last_reward(trace_spans)
+            last_reward = find_final_reward(trace_spans)
 
             end_time = time.time()
             logger.info(
@@ -506,9 +505,8 @@ class AgentRunnerV2(BaseRunner[T_task]):
         store = self.get_store()
 
         if resources is not None:
-            # TODO: move this to store.add_resources()
-            resources_id = "resource-" + str(uuid.uuid4())
-            await store.update_resources(resources_id=resources_id, resources=resources)
+            resources_update = await store.add_resources(resources)
+            resources_id = resources_update.resources_id
         else:
             resources_id = None
 

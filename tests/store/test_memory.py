@@ -43,7 +43,7 @@ async def test_enqueue_rollout_creates_rollout(inmemory_store: InMemoryLightning
         input=sample, mode="train", resources_id="res-123", metadata=metadata
     )
 
-    assert rollout.rollout_id.startswith("rollout-")
+    assert rollout.rollout_id.startswith("ro-")
     assert rollout.input == sample
     assert rollout.mode == "train"
     assert rollout.resources_id == "res-123"
@@ -60,8 +60,8 @@ async def test_add_rollout_initializes_attempt(inmemory_store: InMemoryLightning
     attempt_rollout = await inmemory_store.start_rollout(input=sample, mode="val", resources_id="res-add")
 
     assert attempt_rollout.status == "preparing"
-    assert attempt_rollout.rollout_id.startswith("rollout-")
-    assert attempt_rollout.attempt.attempt_id.startswith("attempt-")
+    assert attempt_rollout.rollout_id.startswith("ro-")
+    assert attempt_rollout.attempt.attempt_id.startswith("at-")
     assert attempt_rollout.attempt.sequence_id == 1
     assert attempt_rollout.attempt.status == "preparing"
 
@@ -343,6 +343,73 @@ async def test_requeue_mechanism(inmemory_store: InMemoryLightningStore) -> None
 
 
 @pytest.mark.asyncio
+async def test_add_resources_generates_id_and_stores(inmemory_store: InMemoryLightningStore) -> None:
+    """Test that add_resources generates a resources_id and stores the resources."""
+    # Initially no resources
+    assert await inmemory_store.get_latest_resources() is None
+
+    # Add resources using add_resources (auto-generates ID)
+    llm = LLM(
+        resource_type="llm",
+        endpoint="http://localhost:8080/v1",
+        model="test-model",
+        sampling_parameters={"temperature": 0.7},
+    )
+    prompt = PromptTemplate(resource_type="prompt_template", template="Hello {name}!", engine="f-string")
+
+    resources_update = await inmemory_store.add_resources({"main_llm": llm, "greeting": prompt})
+
+    # Verify resources_id was auto-generated with correct prefix
+    assert resources_update.resources_id.startswith("rs-")
+    assert len(resources_update.resources_id) == 15  # "rs-" + 12 char hash
+
+    # Verify resources were stored correctly
+    assert isinstance(resources_update.resources["main_llm"], LLM)
+    assert resources_update.resources["main_llm"].model == "test-model"
+    assert isinstance(resources_update.resources["greeting"], PromptTemplate)
+    assert resources_update.resources["greeting"].template == "Hello {name}!"
+
+    # Verify it's set as latest
+    latest = await inmemory_store.get_latest_resources()
+    assert latest is not None
+    assert latest.resources_id == resources_update.resources_id
+    assert latest.resources["main_llm"].model == "test-model"  # type: ignore
+
+    # Verify we can retrieve by ID
+    retrieved = await inmemory_store.get_resources_by_id(resources_update.resources_id)
+    assert retrieved is not None
+    assert retrieved.resources_id == resources_update.resources_id
+
+
+@pytest.mark.asyncio
+async def test_add_resources_multiple_times_generates_unique_ids(inmemory_store: InMemoryLightningStore) -> None:
+    """Test that multiple calls to add_resources generate unique IDs."""
+    llm1 = LLM(resource_type="llm", endpoint="http://localhost:8080", model="model-v1")
+    llm2 = LLM(resource_type="llm", endpoint="http://localhost:8080", model="model-v2")
+
+    update1 = await inmemory_store.add_resources({"llm": llm1})
+    update2 = await inmemory_store.add_resources({"llm": llm2})
+
+    # IDs should be different
+    assert update1.resources_id != update2.resources_id
+    assert update1.resources_id.startswith("rs-")
+    assert update2.resources_id.startswith("rs-")
+
+    # Both should be retrievable
+    retrieved1 = await inmemory_store.get_resources_by_id(update1.resources_id)
+    retrieved2 = await inmemory_store.get_resources_by_id(update2.resources_id)
+    assert retrieved1 is not None
+    assert retrieved2 is not None
+    assert retrieved1.resources["llm"].model == "model-v1"  # type: ignore
+    assert retrieved2.resources["llm"].model == "model-v2"  # type: ignore
+
+    # Latest should be the second one
+    latest = await inmemory_store.get_latest_resources()
+    assert latest is not None
+    assert latest.resources_id == update2.resources_id
+
+
+@pytest.mark.asyncio
 async def test_resource_lifecycle(inmemory_store: InMemoryLightningStore) -> None:
     """Test adding, updating, and retrieving resources."""
     # Initially no resources
@@ -442,7 +509,7 @@ async def test_span_sequence_generation(inmemory_store: InMemoryLightningStore, 
     assert span2.sequence_id == 4
 
     # Different attempt reuses the same rollout_id
-    seq_id = await inmemory_store.get_next_span_sequence_id(rollout.rollout_id, "attempt-2")
+    seq_id = await inmemory_store.get_next_span_sequence_id(rollout.rollout_id, "attempt-does-not-exist")
     assert seq_id == 5
 
 
@@ -594,6 +661,253 @@ async def test_wait_timeout(inmemory_store: InMemoryLightningStore) -> None:
 
     assert elapsed < 0.2  # Should timeout quickly
     assert len(completed) == 0  # No completions
+
+
+@pytest.mark.asyncio
+async def test_wait_with_timeout_none_polling(inmemory_store: InMemoryLightningStore) -> None:
+    """Test wait_for_rollouts with timeout=None uses polling and can be cancelled."""
+    rollout = await inmemory_store.enqueue_rollout(input={"test": "indefinite"})
+
+    async def wait_indefinitely():
+        return await inmemory_store.wait_for_rollouts(rollout_ids=[rollout.rollout_id], timeout=None)
+
+    # Start waiting with timeout=None
+    wait_task = asyncio.create_task(wait_indefinitely())
+
+    # Give it a moment to start polling
+    await asyncio.sleep(0.1)
+
+    # Complete the rollout
+    await inmemory_store.update_rollout(rollout_id=rollout.rollout_id, status="succeeded")
+
+    # The wait should complete now
+    completed = await asyncio.wait_for(wait_task, timeout=1.0)
+    assert len(completed) == 1
+    assert completed[0].rollout_id == rollout.rollout_id
+    assert completed[0].status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_wait_with_timeout_none_can_be_cancelled(inmemory_store: InMemoryLightningStore) -> None:
+    """Test that wait_for_rollouts with timeout=None can be cancelled cleanly."""
+    rollout = await inmemory_store.enqueue_rollout(input={"test": "cancel"})
+
+    async def wait_indefinitely():
+        return await inmemory_store.wait_for_rollouts(rollout_ids=[rollout.rollout_id], timeout=None)
+
+    # Start waiting with timeout=None
+    wait_task = asyncio.create_task(wait_indefinitely())
+
+    # Give it time to start polling
+    await asyncio.sleep(0.15)  # Wait for at least one poll cycle
+
+    # Cancel the task
+    wait_task.cancel()
+
+    # Should raise CancelledError
+    with pytest.raises(asyncio.CancelledError):
+        await wait_task
+
+    # Task should be cancelled, no hanging threads
+    assert wait_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_wait_with_timeout_zero(inmemory_store: InMemoryLightningStore) -> None:
+    """Test wait_for_rollouts with timeout=0 returns immediately."""
+    rollout = await inmemory_store.enqueue_rollout(input={"test": "zero"})
+
+    start = time.time()
+    completed = await inmemory_store.wait_for_rollouts(rollout_ids=[rollout.rollout_id], timeout=0)
+    elapsed = time.time() - start
+
+    # Should return almost immediately
+    assert elapsed < 0.05
+    assert len(completed) == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_with_already_completed_rollout(inmemory_store: InMemoryLightningStore) -> None:
+    """Test wait_for_rollouts returns immediately for already completed rollouts."""
+    rollout = await inmemory_store.enqueue_rollout(input={"test": "already_done"})
+
+    # Complete it first
+    await inmemory_store.update_rollout(rollout_id=rollout.rollout_id, status="succeeded")
+
+    # Wait should return immediately without blocking
+    start = time.time()
+    completed = await inmemory_store.wait_for_rollouts(rollout_ids=[rollout.rollout_id], timeout=5.0)
+    elapsed = time.time() - start
+
+    assert elapsed < 0.1  # Should be instant
+    assert len(completed) == 1
+    assert completed[0].rollout_id == rollout.rollout_id
+    assert completed[0].status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_wait_multiple_rollouts_different_completion_times(inmemory_store: InMemoryLightningStore) -> None:
+    """Test waiting for multiple rollouts that complete at different times."""
+    r1 = await inmemory_store.enqueue_rollout(input={"id": 1})
+    r2 = await inmemory_store.enqueue_rollout(input={"id": 2})
+    r3 = await inmemory_store.enqueue_rollout(input={"id": 3})
+
+    async def wait_for_all():
+        return await inmemory_store.wait_for_rollouts(
+            rollout_ids=[r1.rollout_id, r2.rollout_id, r3.rollout_id], timeout=2.0
+        )
+
+    wait_task = asyncio.create_task(wait_for_all())
+
+    # Complete them at different times
+    await asyncio.sleep(0.05)
+    await inmemory_store.update_rollout(rollout_id=r2.rollout_id, status="succeeded")
+
+    await asyncio.sleep(0.05)
+    await inmemory_store.update_rollout(rollout_id=r1.rollout_id, status="failed")
+
+    await asyncio.sleep(0.05)
+    await inmemory_store.update_rollout(rollout_id=r3.rollout_id, status="succeeded")
+
+    # All should be collected
+    completed = await wait_task
+    assert len(completed) == 3
+    completed_ids = {r.rollout_id for r in completed}
+    assert completed_ids == {r1.rollout_id, r2.rollout_id, r3.rollout_id}
+
+
+@pytest.mark.asyncio
+async def test_wait_partial_completion_on_timeout(inmemory_store: InMemoryLightningStore) -> None:
+    """Test that wait_for_rollouts returns partial results when timeout occurs."""
+    r1 = await inmemory_store.enqueue_rollout(input={"id": 1})
+    r2 = await inmemory_store.enqueue_rollout(input={"id": 2})
+    r3 = await inmemory_store.enqueue_rollout(input={"id": 3})
+
+    async def wait_with_short_timeout():
+        return await inmemory_store.wait_for_rollouts(
+            rollout_ids=[r1.rollout_id, r2.rollout_id, r3.rollout_id], timeout=0.2
+        )
+
+    wait_task = asyncio.create_task(wait_with_short_timeout())
+
+    # Only complete one before timeout
+    await asyncio.sleep(0.05)
+    await inmemory_store.update_rollout(rollout_id=r1.rollout_id, status="succeeded")
+
+    # Wait for timeout
+    completed = await wait_task
+
+    # Should only get r1
+    assert len(completed) == 1
+    assert completed[0].rollout_id == r1.rollout_id
+
+
+@pytest.mark.asyncio
+async def test_wait_concurrent_waiters_on_same_rollout(inmemory_store: InMemoryLightningStore) -> None:
+    """Test multiple concurrent waiters on the same rollout."""
+    rollout = await inmemory_store.enqueue_rollout(input={"test": "concurrent"})
+
+    async def wait_for_completion():
+        return await inmemory_store.wait_for_rollouts(rollout_ids=[rollout.rollout_id], timeout=2.0)
+
+    # Start multiple waiters concurrently
+    wait_tasks = [asyncio.create_task(wait_for_completion()) for _ in range(5)]
+
+    await asyncio.sleep(0.05)
+
+    # Complete the rollout
+    await inmemory_store.update_rollout(rollout_id=rollout.rollout_id, status="succeeded")
+
+    # All waiters should complete
+    results = await asyncio.gather(*wait_tasks)
+
+    # Each waiter should get the completed rollout
+    for completed in results:
+        assert len(completed) == 1
+        assert completed[0].rollout_id == rollout.rollout_id
+        assert completed[0].status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_wait_nonexistent_rollout_with_finite_timeout(inmemory_store: InMemoryLightningStore) -> None:
+    """Test waiting for non-existent rollout with finite timeout."""
+    start = time.time()
+    completed = await inmemory_store.wait_for_rollouts(rollout_ids=["nonexistent"], timeout=0.1)
+    elapsed = time.time() - start
+
+    # Should timeout quickly (not wait indefinitely)
+    assert elapsed < 0.2
+    assert len(completed) == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_mixed_existing_and_nonexistent_rollouts(inmemory_store: InMemoryLightningStore) -> None:
+    """Test waiting for mix of existing and non-existent rollouts."""
+    r1 = await inmemory_store.enqueue_rollout(input={"id": 1})
+
+    async def wait_for_mixed():
+        return await inmemory_store.wait_for_rollouts(
+            rollout_ids=[r1.rollout_id, "nonexistent1", "nonexistent2"], timeout=0.5
+        )
+
+    wait_task = asyncio.create_task(wait_for_mixed())
+
+    await asyncio.sleep(0.05)
+    await inmemory_store.update_rollout(rollout_id=r1.rollout_id, status="succeeded")
+
+    completed = await wait_task
+
+    # Should only get the existing, completed rollout
+    assert len(completed) == 1
+    assert completed[0].rollout_id == r1.rollout_id
+
+
+@pytest.mark.asyncio
+async def test_wait_event_set_before_wait_starts(inmemory_store: InMemoryLightningStore) -> None:
+    """Test that waiting on an already-set event returns immediately."""
+    rollout = await inmemory_store.enqueue_rollout(input={"test": "early_complete"})
+
+    # Complete it before waiting
+    await inmemory_store.update_rollout(rollout_id=rollout.rollout_id, status="succeeded")
+
+    # Now start waiting - should return immediately
+    start = time.time()
+    completed = await inmemory_store.wait_for_rollouts(rollout_ids=[rollout.rollout_id], timeout=10.0)
+    elapsed = time.time() - start
+
+    assert elapsed < 0.05  # Should be instant
+    assert len(completed) == 1
+    assert completed[0].status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_wait_polling_interval_with_timeout_none(inmemory_store: InMemoryLightningStore) -> None:
+    """Test that timeout=None polling doesn't busy-wait (uses reasonable intervals)."""
+    rollout = await inmemory_store.enqueue_rollout(input={"test": "polling"})
+
+    start = time.time()
+
+    async def wait_and_complete():
+        # Start waiting with timeout=None
+        wait_task = asyncio.create_task(
+            inmemory_store.wait_for_rollouts(rollout_ids=[rollout.rollout_id], timeout=None)
+        )
+
+        # Wait for 0.5 seconds to let polling happen
+        await asyncio.sleep(0.5)
+
+        # Complete the rollout
+        await inmemory_store.update_rollout(rollout_id=rollout.rollout_id, status="succeeded")
+
+        return await wait_task
+
+    completed = await wait_and_complete()
+    elapsed = time.time() - start
+
+    # Should complete after ~0.5s (when we set the event)
+    assert 0.4 < elapsed < 0.7
+    assert len(completed) == 1
+    assert completed[0].status == "succeeded"
 
 
 # Concurrent Access Tests
@@ -976,7 +1290,7 @@ async def test_add_attempt_creates_new_attempt(inmemory_store: InMemoryLightning
     assert attempted_rollout.attempt.sequence_id == 1
     assert attempted_rollout.attempt.status == "preparing"
     assert attempted_rollout.attempt.rollout_id == rollout.rollout_id
-    assert attempted_rollout.attempt.attempt_id.startswith("attempt-")
+    assert attempted_rollout.attempt.attempt_id.startswith("at-")
 
     # Verify attempt is stored
     attempts = await inmemory_store.query_attempts(rollout.rollout_id)

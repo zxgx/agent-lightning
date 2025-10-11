@@ -14,15 +14,13 @@ from opentelemetry.trace.status import Status, StatusCode
 
 from agentlightning.execution.events import Event, ThreadingEvent
 from agentlightning.litagent import LitAgent
-from agentlightning.reward import emit_reward, get_last_reward
+from agentlightning.reward import emit_reward, find_final_reward
 from agentlightning.runner import AgentRunnerV2
 from agentlightning.runner.base import BaseRunner
 from agentlightning.store.base import LightningStore
 from agentlightning.store.memory import InMemoryLightningStore
 from agentlightning.tracer.base import BaseTracer
-from agentlightning.types import Hook, RolloutV2, Span
-from agentlightning.types.core import LLM, PromptTemplate
-from agentlightning.types.tracer import SpanNames
+from agentlightning.types import LLM, Hook, PromptTemplate, RolloutV2, Span, SpanNames
 
 trace_api.set_tracer_provider(TracerProvider())
 
@@ -196,7 +194,7 @@ async def test_step_records_spans_for_none_result() -> None:
     rollout_id, attempt_id = await assert_single_attempt_succeeded(store)
     spans = await store.query_spans(rollout_id, attempt_id)
     assert [span.name for span in spans] == ["work"]
-    assert get_last_reward(spans) is None
+    assert find_final_reward(spans) is None
 
 
 @pytest.mark.asyncio

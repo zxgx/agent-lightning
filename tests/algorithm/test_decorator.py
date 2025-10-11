@@ -10,7 +10,7 @@ import pytest
 
 from agentlightning.algorithm.base import FunctionalAlgorithm, algo
 from agentlightning.store.base import LightningStore
-from agentlightning.types.core import Dataset
+from agentlightning.types import Dataset
 
 
 @algo
@@ -145,6 +145,7 @@ async def test_async_algorithm_run_method():
     val_data = ["async-val"]
 
     # Run method should return an awaitable
+    assert async_algo.is_async()
     result = async_algo.run(cast(Dataset[Any], train_data), cast(Dataset[Any], val_data))
     assert inspect.iscoroutine(result)
 
