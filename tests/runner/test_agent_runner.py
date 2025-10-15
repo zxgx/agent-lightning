@@ -12,15 +12,15 @@ from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.trace import SpanContext, TraceFlags, TraceState
 from opentelemetry.trace.status import Status, StatusCode
 
-from agentlightning.execution.events import Event, ThreadingEvent
+from agentlightning.execution.events import ExecutionEvent, ThreadingEvent
 from agentlightning.litagent import LitAgent
 from agentlightning.reward import emit_reward, find_final_reward
-from agentlightning.runner import AgentRunnerV2
+from agentlightning.runner import LitAgentRunner
 from agentlightning.runner.base import BaseRunner
 from agentlightning.store.base import LightningStore
 from agentlightning.store.memory import InMemoryLightningStore
 from agentlightning.tracer.base import BaseTracer
-from agentlightning.types import LLM, Hook, NamedResources, PromptTemplate, RolloutV2, Span, SpanNames
+from agentlightning.types import LLM, Hook, NamedResources, PromptTemplate, Rollout, Span, SpanNames
 
 trace_api.set_tracer_provider(TracerProvider())
 
@@ -117,18 +117,18 @@ async def setup_runner(
     max_rollouts: Optional[int] = None,
     poll_interval: float = 0.01,
     hooks: Sequence[Hook] = (),
-) -> tuple[AgentRunnerV2[Any], InMemoryLightningStore, DummyTracer]:
+) -> tuple[LitAgentRunner[Any], InMemoryLightningStore, DummyTracer]:
     tracer = tracer or DummyTracer()
     store = InMemoryLightningStore()
     await store.update_resources("default", {"llm": LLM(endpoint="http://localhost", model="dummy")})
 
-    runner = AgentRunnerV2[Any](tracer=tracer, max_rollouts=max_rollouts, poll_interval=poll_interval)
+    runner = LitAgentRunner[Any](tracer=tracer, max_rollouts=max_rollouts, poll_interval=poll_interval)
     runner.init(agent=agent, hooks=hooks)
     runner.init_worker(worker_id=0, store=store)
     return runner, store, tracer
 
 
-def teardown_runner(runner: AgentRunnerV2[Any]) -> None:
+def teardown_runner(runner: LitAgentRunner[Any]) -> None:
     runner.teardown_worker(worker_id=0)
     runner.teardown()
 
@@ -148,16 +148,16 @@ class RecordingHook(Hook):
         self.calls: List[str] = []
         self.received_spans: Optional[List[ReadableSpan] | List[Span]] = None
 
-    async def on_rollout_start(self, *, agent: LitAgent[Any], runner: BaseRunner[Any], rollout: RolloutV2) -> None:
+    async def on_rollout_start(self, *, agent: LitAgent[Any], runner: BaseRunner[Any], rollout: Rollout) -> None:
         self.calls.append("on_rollout_start")
 
     async def on_trace_start(
-        self, *, agent: LitAgent[Any], runner: BaseRunner[Any], tracer: BaseTracer, rollout: RolloutV2
+        self, *, agent: LitAgent[Any], runner: BaseRunner[Any], tracer: BaseTracer, rollout: Rollout
     ) -> None:
         self.calls.append("on_trace_start")
 
     async def on_trace_end(
-        self, *, agent: LitAgent[Any], runner: BaseRunner[Any], tracer: BaseTracer, rollout: RolloutV2
+        self, *, agent: LitAgent[Any], runner: BaseRunner[Any], tracer: BaseTracer, rollout: Rollout
     ) -> None:
         self.calls.append("on_trace_end")
 
@@ -166,7 +166,7 @@ class RecordingHook(Hook):
         *,
         agent: LitAgent[Any],
         runner: BaseRunner[Any],
-        rollout: RolloutV2,
+        rollout: Rollout,
         spans: List[ReadableSpan] | List[Span],
     ) -> None:
         self.calls.append("on_rollout_end")
@@ -180,7 +180,7 @@ async def test_step_records_spans_for_none_result() -> None:
     class AsyncSpanAgent(LitAgent[Dict[str, Any]]):
         async def validation_rollout_async(self, task: Dict[str, Any], resources: Dict[str, Any], rollout: Any) -> None:
             span = tracer.record_span("work", {"task_id": task["task_id"]})
-            store = cast(AgentRunnerV2[Dict[str, Any]], self.runner).get_store()
+            store = cast(LitAgentRunner[Dict[str, Any]], self.runner).get_store()
             await store.add_otel_span(rollout.rollout_id, rollout.attempt.attempt_id, span)  # type: ignore[attr-defined]
             return None
 
@@ -360,7 +360,7 @@ async def test_iter_waits_when_queue_empty_calls_sleep(monkeypatch: pytest.Monke
 
     sleep_calls = 0
 
-    async def fake_sleep(event: Optional[Event] = None) -> None:
+    async def fake_sleep(event: Optional[ExecutionEvent] = None) -> None:
         nonlocal sleep_calls
         sleep_calls += 1
         if event is not None:
@@ -495,7 +495,7 @@ async def test_hooks_triggered_in_order() -> None:
 
 @pytest.mark.asyncio
 async def test_step_returns_completed_rollout() -> None:
-    """Test that step() returns a RolloutV2 object after execution."""
+    """Test that step() returns a Rollout object after execution."""
 
     class SimpleAgent(LitAgent[Dict[str, Any]]):
         def validation_rollout(self, task: Dict[str, Any], resources: Dict[str, Any], rollout: Any) -> float:
@@ -508,8 +508,8 @@ async def test_step_returns_completed_rollout() -> None:
     finally:
         teardown_runner(runner)
 
-    # Verify the result is a RolloutV2 object
-    assert isinstance(result, RolloutV2)
+    # Verify the result is a Rollout object
+    assert isinstance(result, Rollout)
     assert result.status == "succeeded"
     assert result.input == {"task": "test"}
 
@@ -558,7 +558,7 @@ async def test_step_raises_when_rollout_fetch_fails(monkeypatch: pytest.MonkeyPa
     # Mock get_rollout_by_id to return None
     original_get_rollout = store.get_rollout_by_id
 
-    async def mock_get_rollout_by_id(rollout_id: str) -> Optional[RolloutV2]:
+    async def mock_get_rollout_by_id(rollout_id: str) -> Optional[Rollout]:
         return None
 
     monkeypatch.setattr(store, "get_rollout_by_id", mock_get_rollout_by_id)
@@ -627,7 +627,7 @@ async def test_step_impl_returns_rollout_id_on_resource_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_step_with_custom_resources_returns_rollout() -> None:
-    """Test that step() with custom resources returns a valid RolloutV2."""
+    """Test that step() with custom resources returns a valid Rollout."""
 
     class ResourceAgent(LitAgent[Dict[str, Any]]):
         def validation_rollout(self, task: Dict[str, Any], resources: Dict[str, Any], rollout: Any) -> float:
@@ -647,8 +647,8 @@ async def test_step_with_custom_resources_returns_rollout() -> None:
     finally:
         teardown_runner(runner)
 
-    # Verify the result is a valid RolloutV2
-    assert isinstance(result, RolloutV2)
+    # Verify the result is a valid Rollout
+    assert isinstance(result, Rollout)
     assert result.status == "succeeded"
     assert result.input == {"task": "test"}
 

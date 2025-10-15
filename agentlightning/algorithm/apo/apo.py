@@ -18,10 +18,10 @@ from typing import Any, Counter, Dict, Generic, Iterator, List, Optional, Sequen
 import poml
 from openai import AsyncOpenAI
 
-from agentlightning.adapter.messages import TraceMessagesAdapter
+from agentlightning.adapter.messages import TraceToMessages
 from agentlightning.algorithm.base import BaseAlgorithm
 from agentlightning.reward import find_final_reward
-from agentlightning.types import Dataset, NamedResources, PromptTemplate, RolloutMode, RolloutStatus, RolloutV2
+from agentlightning.types import Dataset, NamedResources, PromptTemplate, Rollout, RolloutMode, RolloutStatus
 
 logger = logging.getLogger(__name__)
 
@@ -232,19 +232,19 @@ class APO(BaseAlgorithm, Generic[T_task]):
                 return name, resource
         raise ValueError("No prompt template resource found in initial_resources")
 
-    def get_adapter(self) -> TraceMessagesAdapter:
+    def get_adapter(self) -> TraceToMessages:
         """
         Get the adapter for converting spans to messages.
 
         Returns:
-            The TraceMessagesAdapter instance for this algorithm.
+            The TraceToMessages instance for this algorithm.
 
         Raises:
-            ValueError: If the adapter is not a TraceMessagesAdapter.
+            ValueError: If the adapter is not a TraceToMessages.
         """
         adapter = super().get_adapter()
-        if not isinstance(adapter, TraceMessagesAdapter):
-            raise ValueError("Adapter must be a TraceMessagesAdapter for APO algorithm")
+        if not isinstance(adapter, TraceToMessages):
+            raise ValueError("Adapter must be a TraceToMessages for APO algorithm")
         return adapter
 
     def get_best_prompt(self) -> PromptTemplate:
@@ -393,7 +393,7 @@ class APO(BaseAlgorithm, Generic[T_task]):
 
     async def get_rollout_results(
         self,
-        rollout: List[RolloutV2],
+        rollout: List[Rollout],
         *,
         prefix: Optional[str] = None,
     ) -> List[RolloutResultForAPO]:
@@ -476,7 +476,7 @@ class APO(BaseAlgorithm, Generic[T_task]):
             rollout_ids.append(r.rollout_id)
 
         deadline = time.time() + self.rollout_batch_timeout
-        finished: List[RolloutV2] = []
+        finished: List[Rollout] = []
         while time.time() < deadline:
             finished = await store.wait_for_rollouts(rollout_ids=rollout_ids, timeout=0.0)
             if len(finished) >= len(rollout_ids):
