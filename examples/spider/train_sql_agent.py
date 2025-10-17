@@ -7,7 +7,7 @@ The script supports three different training configurations:
 
 1. 'fast' - A lightweight configuration optimized for CI testing with reduced epochs
 2. 'qwen' - Standard configuration using Qwen-2.5-Coder-1.5B-Instruct model
-3. 'llama' - Configuration using LLaMA-3.2-3B-Instruct model with JSON formatting
+3. 'llama' - Configuration using LLaMA-3.2-1B-Instruct model with JSON formatting
 
 Usage:
     python train_sql_agent.py fast    # Fast training for CI/testing
@@ -148,7 +148,7 @@ def train(config: Dict[str, Any], active_agent: Optional[str]) -> None:
 
     agent = LitSQLAgent()
     algorithm = agl.VERL(config)
-    trainer = agl.Trainer(n_workers=10, algorithm=algorithm, adapter={"agent_match": active_agent})
+    trainer = agl.Trainer(n_runners=10, algorithm=algorithm, adapter={"agent_match": active_agent})
     print("Adapter agent match acknowledged:", trainer.adapter.agent_match)  # type: ignore
 
     train_data = pd.read_parquet(config["data"]["train_files"]).to_dict(orient="records")  # type: ignore

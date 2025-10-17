@@ -52,7 +52,8 @@ plugins:
       enable_creation_date: true
       type: timeago
   - git-authors
-  - macros
+  - macros:
+      module_name: docs/macros/source_links
   - mkdocstrings:
       handlers:
         python:
@@ -77,6 +78,9 @@ extra:
 
 extra_javascript:
   - https://unpkg.com/mermaid@10.6.1/dist/mermaid.min.js
+  - https://unpkg.com/chart.js@4.5.1/dist/chart.umd.min.js
+  - javascripts/charts.js
+  - javascripts/move-source-file.js
 
 nav:
   - Home: index.md
@@ -90,6 +94,7 @@ nav:
   - Learning More:
     - Write Agents: tutorials/write-agents.md
     - Debugging: tutorials/debug.md
+    - Working with Traces: tutorials/traces.md
     - Parallelize: tutorials/parallelize.md
   - Algorithm Zoo:
     - Overview: algorithm-zoo/index.md
@@ -98,7 +103,7 @@ nav:
   - Deep Dive:
     - Bird's Eye View: deep-dive/birds-eye-view.md
     - Understanding Store: deep-dive/store.md
-    - Understanding Tracing: deep-dive/tracing.md
+    - Serving LLM: deep-dive/serving-llm.md
   - API References:
     - Agent: reference/agent.md
     - Algorithm: reference/algorithm.md

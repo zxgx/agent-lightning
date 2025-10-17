@@ -143,6 +143,16 @@ Programmatically this is encapsulated by [`Span.from_opentelemetry(readable_span
 
     [`add_span`][agentlightning.LightningStore.add_span] or [`add_otel_span`][agentlightning.LightningStore.add_otel_span] both appends a span *and* acts as a heartbeat that can revive `unresponsive` → `running`.
 
+## Store Implementations
+
+Currently, the only out-of-the-box implementation is [`InMemoryLightningStore`][agentlightning.InMemoryLightningStore]:
+
+- Fast startup, zero external dependencies, and ideal for local development, CI, and unit tests.
+- Fully asyncio-safe for writes; most reader operations can iterate without locks, except those that need to perform multiple queries.
+- Includes a best-effort span eviction policy once memory crosses a configured watermark; querying evicted spans raises a clear error so callers can fall back.
+
+For production you will likely want persistence. We’re actively building a SQLite-backed store that keeps the same API surface while adding durability, crash recovery, and better historical span queries. If you need something sooner, implement your own store by subclassing [`LightningStore`][agentlightning.LightningStore] and providing concrete storage for the small set of abstract methods (`enqueue_rollout`, `dequeue_rollout`, `update_attempt`, `add_span`, etc.). This document plus the tests in `tests/store/` illustrate the expected behavior.
+
 ## Thread Safety
 
 **[`LightningStoreThreaded`][agentlightning.LightningStoreThreaded]** is a subclass of [`LightningStore`][agentlightning.LightningStore] that wraps another underlying store to make a store instance safe for multi-threaded callers. It wraps every state-mutating call in a mutex. Specifically:
@@ -153,6 +163,10 @@ Programmatically this is encapsulated by [`Span.from_opentelemetry(readable_span
 ## Process Safety and Client-server Store
 
 **[`LightningStoreServer`][agentlightning.LightningStoreServer]** wraps another underlying store and runs a FastAPI app to expose the store API over HTTP. [`LightningStoreClient`][agentlightning.LightningStoreClient] is a small [`LightningStore`][agentlightning.LightningStore] implementation that talks to the HTTP API.
+
+!!! warning
+
+    The server HTTP API is not considered a stable API at this moment. Users are encouraged to use the [`LightningStoreClient`][agentlightning.LightningStoreClient] to communicate with the server as a stable interface.
 
 The server tracks the creator PID. In the owner process it delegates directly to the in-memory store; in other processes it lazily constructs a [`LightningStoreClient`][agentlightning.LightningStoreClient] to talk to the HTTP API. This prevents accidental cross-process mutation of the wrong memory image. When the server is pickled (e.g., via `multiprocessing`), only the minimal fields are serialized, but **NOT** the FastAPI/uvicorn objects. Subprocesses won’t accidentally carry live server state. Forked subprocess should also use [`LightningStoreClient`][agentlightning.LightningStoreClient] to communicate with the server in the main process.
 
