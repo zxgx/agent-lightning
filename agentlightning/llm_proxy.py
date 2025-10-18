@@ -490,13 +490,17 @@ class LLMProxy:
 
     Lifecycle:
 
-    * ``start()`` writes config, starts uvicorn server in a thread, and waits until ready.
-    * ``stop()`` tears down the server and removes the temp config file.
-    * ``restart()`` convenience wrapper to stop then start.
+    * [`start()`][agentlightning.LLMProxy.start] writes config, starts uvicorn server in a thread, and waits until ready.
+    * [`stop()`][agentlightning.LLMProxy.stop] tears down the server and removes the temp config file.
+    * [`restart()`][agentlightning.LLMProxy.restart] convenience wrapper to stop then start.
 
     Usage Note:
     As the LLM Proxy sets up an OpenTelemetry tracer, it's recommended to run it in a different
     process from the main runner (i.e., tracer from agents).
+
+    !!! warning
+
+        The LLM Proxy does support streaming, but the tracing is still problematic when streaming is enabled.
 
     Args:
         port: TCP port to bind.

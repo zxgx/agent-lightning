@@ -294,6 +294,8 @@ flowchart TD
 
 ## Putting It All Together: A Reinforcement Learning Example (VERL)
 
+[](){ #birds-eye-view-verl-example }
+
 VERL shows how an algorithm consumes the shared infrastructure. For historical reasons, code lives in `agentlightning.algorithm.verl` and `agentlightning.verl`. The latter is legacy and reuses terms like `Trainer` in confusing ways. The former is a thin wrapper that conforms to the new algorithm interface. Future versions will merge the two.
 
 Reinforcement learning aims to learn a policy that takes actions in states to maximize expected reward. For agents, the policy is usually a language model. Inputs are prompts (state). Outputs are generated text (action). A numeric score judges quality (reward). The `(state, action, reward)` **triplet** is the basic learning unit.
@@ -430,6 +432,8 @@ flowchart TB
 You can configure which role runs on the main thread. If the main thread runs the algorithm, it is able to spawn multiple runner threads. If it runs a runner, `n_runners` must be 1 and the runner lives on the main thread.
 
 ### Client-server Strategy
+
+[](){ #birds-eye-view-client-server-strategy }
 
 `ClientServerExecutionStrategy` splits concerns across processes. The algorithm bundle starts a `LightningStoreServer` (HTTP API) that wraps the underlying store. Runners connect via `LightningStoreClient` to call the same interface over REST. The server embeds a client to support algorithm-launched subprocesses (e.g., an LLM proxy worker) that need to talk back to the algorithm’s process through the same API.
 
