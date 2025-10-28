@@ -1,22 +1,25 @@
+# Copyright (c) Microsoft. All rights reserved.
+
 # type: ignore
 # The evaluation code is from https://github.com/taoyds/test-suite-sql-eval
 
-import os
-import re
 import asyncio
-import sqlite3
-import threading
-from typing import Tuple, Any, List, Set
-from itertools import product
-from collections import defaultdict
-import tqdm
-import random
-from .parse import get_all_preds_for_execution, remove_distinct
-import time
+import os
 import pickle as pkl
+import random
+import re
+import sqlite3
 import subprocess
-from itertools import chain
+import threading
+import time
+from collections import defaultdict
+from itertools import chain, product
+from typing import Any, List, Set, Tuple
 
+import tqdm
+
+from .async_utils import run_sync_ephemeral
+from .parse import get_all_preds_for_execution, remove_distinct
 
 threadLock = threading.Lock()
 TIMEOUT = 60
@@ -223,8 +226,8 @@ def eval_exec_match(
             ranger = db_paths
 
         for db_path in ranger:
-            g_flag, g_denotation = asyncio.run(exec_on_db(db_path, g_str))
-            p_flag, p_denotation = asyncio.run(exec_on_db(db_path, pred))
+            g_flag, g_denotation = run_sync_ephemeral(exec_on_db(db_path, g_str))
+            p_flag, p_denotation = run_sync_ephemeral(exec_on_db(db_path, pred))
 
             # we should expect the gold to be succesfully executed on the database
             assert g_flag != "exception", "gold query %s has error on database file %s" % (g_str, db_path)

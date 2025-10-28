@@ -1,3 +1,5 @@
+# Copyright (c) Microsoft. All rights reserved.
+
 """
 This file is not carefully reviewed.
 It might contain unintentional bugs and issues.
@@ -9,25 +11,27 @@ from __future__ import annotations
 import argparse
 import inspect
 import logging
+from typing import _GenericAlias  # type: ignore
 from typing import (
     Any,
+    Callable,
+    Dict,
     List,
+    Tuple,
     Type,
     TypeVar,
     Union,
-    _GenericAlias,  # type: ignore
-    get_origin,
     get_args,
-    Tuple,
-    Callable,
-    overload,
-    Dict,
+    get_origin,
     get_type_hints,
+    overload,
 )
 
 CliConfigurable = Any
 
 logger = logging.getLogger(__name__)
+
+__all__ = ["lightning_cli"]
 
 # TypeVars for precise return type hinting with overloads
 _C = TypeVar("_C", bound=CliConfigurable)
@@ -67,8 +71,8 @@ def nullable_float(value: str) -> float | None:
 
 def _str_to_bool(v: str) -> bool:
     """Converts common string representations of bool to Python bool (case-insensitive)."""
-    if isinstance(v, bool):  # Allow passing bools directly if used programmatically
-        return v
+    if isinstance(v, bool):  # type: ignore
+        return v  # Allow passing bools directly if used programmatically
     lowered_v = v.lower()
     if lowered_v in ("yes", "true", "t", "y", "1"):
         return True
@@ -79,12 +83,17 @@ def _str_to_bool(v: str) -> bool:
 
 
 def _get_param_type_details(param_annotation: Any) -> Tuple[Any, bool, bool]:
-    """
-    Determines the core type, if it's Optional, and if it's a List.
-    Returns: (core_type, is_optional, is_list)
-    - For Optional[T]: (T, True, is_list_status_of_T)
-    - For List[T]: (List[T], is_optional_status_of_List, True)
-    - For Optional[List[T]]: (List[T], True, True)
+    """Normalize an annotation into its core type, optionality, and list status.
+
+    Args:
+        param_annotation: The annotation to inspect.
+
+    Returns:
+        A tuple ``(core_type, is_optional, is_list)`` describing the normalized type.
+
+        - For ``Optional[T]`` → ``(T, True, is_list_status_of_T)``
+        - For ``List[T]`` → ``(List[T], is_optional_status_of_List, True)``
+        - For ``Optional[List[T]]`` → ``(List[T], True, True)``
     """
     is_optional = False
     is_list = False
@@ -305,7 +314,10 @@ def lightning_cli(cls1: Type[_C1], cls2: Type[_C2], cls3: Type[_C3], cls4: Type[
 def lightning_cli(*classes: Type[CliConfigurable]) -> Tuple[CliConfigurable, ...]: ...
 
 
-def lightning_cli(*classes: Type[CliConfigurable]) -> CliConfigurable | Tuple[CliConfigurable, ...]:
+# FIXME: lightning_cli needs to be fixed to comply with the latest trainer implementation.
+
+
+def lightning_cli(*classes: Type[CliConfigurable]) -> CliConfigurable | Tuple[CliConfigurable, ...]:  # type: ignore
     """
     Parses command-line arguments to configure and instantiate provided CliConfigurable classes.
 

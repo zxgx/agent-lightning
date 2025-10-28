@@ -1,18 +1,42 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+# type: ignore
+
+from typing import Any
+
 import hydra
 import ray
-
-from .dataset import AgentDataset
-from .trainer import AgentLightningTrainer
-from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.main_ppo import create_rl_sampler
+from verl.trainer.ppo.reward import load_reward_manager
+
+from agentlightning.adapter import TraceAdapter
+from agentlightning.llm_proxy import LLMProxy
+from agentlightning.store.base import LightningStore
+from agentlightning.types import Dataset
+
+from .dataset import AgentDataset, LoadedDataset
+from .trainer import AgentLightningTrainer
+
+__all__ = [
+    "main",
+    "run_ppo",
+    "TaskRunner",
+]
 
 
 @hydra.main(config_path="pkg://agentlightning/verl", config_name="config", version_base=None)
 def main(config):
-    run_ppo(config)
+    run_ppo(config, train_dataset=None, val_dataset=None, store=None, llm_proxy=None, adapter=None)
 
 
-def run_ppo(config) -> None:
+def run_ppo(
+    config: Any,
+    train_dataset: Dataset[Any] | None,
+    val_dataset: Dataset[Any] | None,
+    store: LightningStore | None,
+    llm_proxy: LLMProxy | None,
+    adapter: TraceAdapter[Any] | None,
+) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(
@@ -23,17 +47,33 @@ def run_ppo(config) -> None:
         )
 
     runner = TaskRunner.remote()
-    ray.get(runner.run.remote(config))
+    ray.get(
+        runner.run.remote(
+            config=config,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            store=store,
+            llm_proxy=llm_proxy,
+            adapter=adapter,
+        )
+    )
 
 
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 class TaskRunner:
-    def run(self, config):
+    def run(
+        self,
+        config: Any,
+        train_dataset: Dataset | None,
+        val_dataset: Dataset | None,
+        store: LightningStore | None,
+        llm_proxy: LLMProxy | None,
+        adapter: TraceAdapter | None,
+    ):
         # print initial config
         from pprint import pprint
 
         from omegaconf import OmegaConf
-
         from verl.utils.fs import copy_to_local
 
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
@@ -121,18 +161,26 @@ class TaskRunner:
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Use our special dataset
-        train_dataset = AgentDataset(
-            data_files=config.data.train_files,
-            tokenizer=tokenizer,
-            processor=processor,
-            config=config.data,
-        )
-        val_dataset = AgentDataset(
-            data_files=config.data.val_files,
-            tokenizer=tokenizer,
-            processor=processor,
-            config=config.data,
-        )
+        if train_dataset is None:
+            train_dataset = AgentDataset(
+                data_files=config.data.train_files,
+                tokenizer=tokenizer,
+                processor=processor,
+                config=config.data,
+            )
+        else:
+            train_dataset = LoadedDataset(train_dataset)
+
+        if val_dataset is None:
+            val_dataset = AgentDataset(
+                data_files=config.data.val_files,
+                tokenizer=tokenizer,
+                processor=processor,
+                config=config.data,
+            )
+        else:
+            val_dataset = LoadedDataset(val_dataset)
+
         train_sampler = create_rl_sampler(config.data, train_dataset)
         trainer = AgentLightningTrainer(
             config=config,
@@ -147,6 +195,9 @@ class TaskRunner:
             val_dataset=val_dataset,
             collate_fn=collate_fn,
             train_sampler=train_sampler,
+            store=store,
+            llm_proxy=llm_proxy,
+            adapter=adapter,
         )
         trainer.init_workers()
         trainer.fit()

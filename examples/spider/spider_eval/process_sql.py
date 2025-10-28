@@ -1,3 +1,5 @@
+# Copyright (c) Microsoft. All rights reserved.
+
 # type: ignore
 # The evaluation code is from https://github.com/taoyds/test-suite-sql-eval
 
@@ -29,6 +31,7 @@
 
 import json
 import sqlite3
+
 from nltk import word_tokenize
 
 CLAUSE_KEYWORDS = ("select", "from", "where", "group", "order", "limit", "intersect", "union", "except")

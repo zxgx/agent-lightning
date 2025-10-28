@@ -1,5 +1,18 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+# type: ignore
+
 import torch
+from datasets import Dataset as HuggingFaceDataset
+from omegaconf import DictConfig
 from verl.utils.dataset.rl_dataset import RLHFDataset
+
+from agentlightning.types import Dataset
+
+__all__ = [
+    "AgentDataset",
+    "LoadedDataset",
+]
 
 
 class AgentDataset(RLHFDataset):
@@ -18,3 +31,14 @@ class AgentDataset(RLHFDataset):
         # Workaround for data proto. At least one tensor is needed.
         row_dict["fake_ids"] = torch.ones(1, dtype=torch.int)
         return row_dict
+
+
+class LoadedDataset(AgentDataset):
+
+    def __init__(self, dataset: Dataset):
+        super().__init__([], None, DictConfig({}))  # type: ignore
+        dataset_copy = [dataset[i] for i in range(len(dataset))]
+        self.dataframe = HuggingFaceDataset.from_list(dataset_copy)
+
+    def _read_files_and_tokenize(self):
+        pass

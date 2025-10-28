@@ -1,34 +1,47 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+# type: ignore
+
+from __future__ import annotations
+
 import random
 from contextlib import contextmanager
 from copy import deepcopy
+from pprint import pprint
 from typing import Dict, Tuple
 
 import numpy as np
 import torch
-from omegaconf import OmegaConf
-from pprint import pprint
-from tqdm import tqdm
-
 from codetiming import Timer
+from omegaconf import OmegaConf
+from tqdm import tqdm
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-from verl.trainer.ppo.ray_trainer import (
-    RayPPOTrainer,
-    AdvantageEstimator,
-    apply_kl_penalty,
-    compute_advantage,
-    compute_response_mask,
-)
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
 )
+from verl.trainer.ppo.ray_trainer import (
+    AdvantageEstimator,
+    RayPPOTrainer,
+    apply_kl_penalty,
+    compute_advantage,
+    compute_response_mask,
+)
 from verl.utils.metric import reduce_metrics
 from verl.utils.tracking import Tracking
 
+from agentlightning.adapter import TraceAdapter, TraceToTripletBase
+from agentlightning.llm_proxy import LLMProxy
+from agentlightning.store.base import LightningStore
+
 from .daemon import AgentModeDaemon
+
+__all__ = [
+    "AgentLightningTrainer",
+]
 
 
 @contextmanager
@@ -50,11 +63,20 @@ class AgentLightningTrainer(RayPPOTrainer):
     RayPPOTrainer and focusing on the agent mode workflow.
 
     Key differences from RayPPOTrainer:
+
     1. Uses AgentModeDaemon for server communication
     2. Simplified data flow without pop/union operations
     3. Direct batch processing through agent daemon
     4. Streamlined validation using agent_mode validation
     """
+
+    def __init__(
+        self, store: LightningStore | None, llm_proxy: LLMProxy | None, adapter: TraceAdapter | None, **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.store = store
+        self.llm_proxy = llm_proxy
+        self.adapter = adapter
 
     def _validate(self):
         assert len(self.val_dataloader) == 1, "Please set val_batch_size to None for better throughput."
@@ -107,7 +129,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                 with _timer("gen_max", timing_raw):
                     gen_baseline_batch = deepcopy(gen_batch)
                     gen_baseline_batch.meta_info["do_sample"] = False
-                    gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                    gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
 
                     batch = batch.union(gen_baseline_output)
                     reward_baseline_tensor = self.reward_fn(batch)
@@ -197,7 +219,7 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # after advantages are assinged, we begin to drop (1) long prompt (2) floor to ppo minisize
             keep_indices = (~batch.batch["is_drop_mask"]).nonzero(as_tuple=True)[0]
-            metrics["agent_mode/n_dropped_sample_because_of_prompt"] = (
+            metrics["training/n_triplets_prompt_too_long"] = (
                 batch.batch["is_drop_mask"].shape[0] - keep_indices.shape[0]
             )
             batch = batch[keep_indices]
@@ -209,7 +231,7 @@ class AgentLightningTrainer(RayPPOTrainer):
             batch.reorder(torch.tensor(random_indices).type(torch.int32))
             n_remained_transition = n_transition // mini_batch_size * mini_batch_size
             batch = batch[list(range(n_remained_transition))]
-            metrics["agent_mode/n_dropped_sample_because_of_mini_batch"] = n_transition - n_remained_transition
+            metrics["training/n_triplets_dropped_remainder"] = n_transition - n_remained_transition
 
             # Agent mode note: Change the order of balance batch;
             #     1. first calculate advantage
@@ -276,16 +298,25 @@ class AgentLightningTrainer(RayPPOTrainer):
         self._load_checkpoint()
 
         assert self.async_rollout_mode, "If agent mode is enabled, async server must be enabled"
+        if self.adapter is not None and not isinstance(self.adapter, TraceToTripletBase):
+            raise ValueError("Adapter must be a TraceToTripletBase for currently VERL implementation.")
         self.agent_mode_daemon = AgentModeDaemon(
             self.config.agentlightning.port,
             self.config.actor_rollout_ref.rollout.n,
             train_information={
-                "model": self.config.actor_rollout_ref.model.path,
+                # Note (Zhiyuan): To avoid further patch into vllm async server, using the same sentence to get the naming here.
+                # However, it is possible that verl updates the naming and causes incompatibility.
+                # Reference: https://github.com/volcengine/verl/blob/5b5e09d9cc20625e436d01f69d9cc739ff681c54/verl/workers/rollout/vllm_rollout/vllm_async_server.py#L217
+                "model": "/".join(self.config.actor_rollout_ref.model.path.split("/")[-2:]),
                 "temperature": self.config.actor_rollout_ref.rollout.temperature,
             },
             tokenizer=self.tokenizer,
             mini_batch_size=self.config.actor_rollout_ref.actor.ppo_mini_batch_size,
             pad_token_id=self.tokenizer.pad_token_id,
+            mode="v1" if self.store is not None else "v0",
+            store=self.store,
+            llm_proxy=self.llm_proxy,
+            adapter=self.adapter,
         )
         self.agent_mode_daemon.start()
 

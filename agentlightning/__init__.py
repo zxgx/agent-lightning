@@ -1,10 +1,19 @@
-__version__ = "0.1.2"
+# Copyright (c) Microsoft. All rights reserved.
 
-from .client import AgentLightningClient, DevTaskLoader
-from .config import lightning_cli
-from .litagent import LitAgent
-from .logging import configure_logger
-from .reward import reward
-from .server import AgentLightningServer
-from .trainer import Trainer
+__version__ = "0.2.1"
+
+from .adapter import *
+from .algorithm import *
+from .client import AgentLightningClient, DevTaskLoader  # deprecated  # type: ignore
+from .config import *
+from .emitter import *
+from .execution import *
+from .litagent import *
+from .llm_proxy import *
+from .logging import *
+from .runner import *
+from .server import AgentLightningServer  # deprecated  # type: ignore
+from .store import *
+from .tracer import *
+from .trainer import *
 from .types import *

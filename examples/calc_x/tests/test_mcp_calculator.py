@@ -1,9 +1,12 @@
-import os
+# Copyright (c) Microsoft. All rights reserved.
+
 import asyncio
 import json
+import os
+
 import openai
 from mcp import ClientSession
-from mcp.client.stdio import stdio_client, StdioServerParameters
+from mcp.client.stdio import StdioServerParameters, stdio_client
 
 
 async def main():
@@ -41,8 +44,8 @@ async def main():
     print(chat_resp)
 
     # 4. Extract the expression argument
-    func_call = chat_resp.choices[0].message.tool_calls[0]
-    expr = json.loads(func_call.function.arguments)["expression"]
+    func_call = chat_resp.choices[0].message.tool_calls[0]  # type: ignore
+    expr = json.loads(func_call.function.arguments)["expression"]  # type: ignore
 
     # 5. Connect to the MCP server and invoke the 'calculate' tool
     async with stdio_client(server_params) as (read, write):
@@ -51,7 +54,7 @@ async def main():
             print("Session initialized.")
             result = await session.call_tool("calculate", arguments={"expression": expr})
             # The structured result is under `.structuredContent`
-            value = result.structuredContent["result"]
+            value = result.structuredContent["result"]  # type: ignore
 
     # 6. Print out the result
     print(f"{expr} = {value}")

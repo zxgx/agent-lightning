@@ -1,4 +1,8 @@
-"""
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Sample code that demonstrates an SQL agent using LangGraph and LangChain,
+trainable with Agent-lightning.
+
 Adapted from https://python.langchain.com/docs/tutorials/sql_qa/
 as well as https://langchain-ai.github.io/langgraph/tutorials/sql-agent/
 """
@@ -7,28 +11,27 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import tempfile
 import time
-import shutil
-from typing import Any, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, cast
 
-import dotenv
+import pandas as pd
 import termcolor
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.utilities import SQLDatabase
 from langchain.chat_models import init_chat_model
+from langchain_community.tools.sql_database.tool import QuerySQLDatabaseTool
+from langchain_community.utilities import SQLDatabase
+from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langchain_community.tools.sql_database.tool import QuerySQLDatabaseTool
-
 from spider_eval.exec_eval import eval_exec_match
 
-import agentlightning
+import agentlightning as agl
 
-agentlightning.configure_logger()
+agl.configure_logger()
 
-logger = agentlightning.configure_logger(name=__name__)
+logger = agl.configure_logger(name=__name__)
 
 
 WRITE_QUERY_PROMPT = ChatPromptTemplate(
@@ -175,7 +178,7 @@ class State(MessagesState):
     answer: str
     feedback: str
     num_turns: int
-    messages: list[BaseMessage]
+    messages: list[AnyMessage]
 
 
 class SQLAgent:
@@ -187,18 +190,18 @@ class SQLAgent:
         debug: bool = False,
         db_schema: str | None = None,
         endpoint: str | None = None,
-        verl_replacement: dict | None = None,
+        verl_replacement: Dict[str, Any] | None = None,
         table_info_truncate: int = 2048,
         execution_truncate: int = 2048,
     ):
-        self.db = SQLDatabase.from_uri(db)
+        self.db = SQLDatabase.from_uri(db)  # type: ignore
         self.db_schema = db_schema
         self.debug = debug
         self.max_turns = max_turns
         self.table_info_truncate = table_info_truncate
         self.execution_truncate = execution_truncate
         if verl_replacement is not None:
-            self.model_name = verl_replacement["model"]
+            self.model_name: str = verl_replacement["model"]  # type: ignore
             assert endpoint is not None
             self.llm = init_chat_model(
                 self.model_name,
@@ -210,7 +213,7 @@ class SQLAgent:
                 max_tokens=2048,
             )
         else:
-            self.model_name = os.environ.get("MODEL", "gpt-4.1-mini")
+            self.model_name: str = os.environ.get("MODEL", "gpt-4.1-mini")
             self.llm = init_chat_model(
                 self.model_name,
                 model_provider="openai",
@@ -236,7 +239,7 @@ class SQLAgent:
                 return self.db_schema
             return "No schema available."
 
-    def invoke_prompt(self, prompt: Any) -> BaseMessage:
+    def invoke_prompt(self, prompt: Any) -> AnyMessage:
         if self.debug:
             for message in prompt.messages:
                 termcolor.cprint(message.pretty_repr(), "blue")
@@ -251,7 +254,7 @@ class SQLAgent:
         if self.debug:
             termcolor.cprint(result.pretty_repr(), "green")
 
-        return result
+        return result  # type: ignore
 
     def truncate_execuion(self, execution: str) -> str:
         """Truncate the execution result to a reasonable length."""
@@ -259,28 +262,28 @@ class SQLAgent:
             return execution[: self.execution_truncate] + "\n... (truncated)"
         return execution
 
-    def parse_query(self, message: BaseMessage) -> str | None:
-        result = None
-        for match in re.finditer(r".*```\w*\n(.*?)\n```.*", message.content, re.DOTALL):
-            result = match.group(1).strip()
-        return result
+    def parse_query(self, message: AnyMessage) -> str | None:
+        result: str | None = None
+        for match in re.finditer(r".*```\w*\n(.*?)\n```.*", message.content, re.DOTALL):  # type: ignore
+            result = match.group(1).strip()  # type: ignore
+        return result  # type: ignore
 
-    def write_query(self, state: State):
+    def write_query(self, state: State) -> State:
         """Generate SQL query to fetch information."""
-        prompt = WRITE_QUERY_PROMPT.invoke(
+        prompt: Any = WRITE_QUERY_PROMPT.invoke(  # type: ignore
             {
                 "dialect": self.db.dialect,
                 "input": state["question"],
                 "table_info": self.get_table_info(),
             }
         )
-        result = self.invoke_prompt(prompt)
+        result = self.invoke_prompt(prompt)  # type: ignore
 
-        query = self.parse_query(result) or result.content
+        query = self.parse_query(result) or result.content  # type: ignore
 
-        return {
+        return {  # type: ignore
             **state,
-            "query": query,
+            "query": query,  # type: ignore
             "num_turns": 1,
             "messages": [*prompt.messages, result],
         }
@@ -288,7 +291,7 @@ class SQLAgent:
     def execute_query(self, state: State) -> State:
         """Execute SQL query."""
         execute_query_tool = QuerySQLDatabaseTool(db=self.db)
-        execution_result = execute_query_tool.invoke(state["query"])
+        execution_result = execute_query_tool.invoke(state["query"])  # type: ignore
         if not isinstance(execution_result, str):
             # Convert to string if it's not already
             execution_result = str(execution_result)
@@ -298,7 +301,7 @@ class SQLAgent:
 
     def check_query(self, state: State) -> State:
         """Check the SQL query for correctness."""
-        prompt = CHECK_QUERY_PROMPT.invoke(
+        prompt: Any = CHECK_QUERY_PROMPT.invoke(  # type: ignore
             {
                 "dialect": self.db.dialect,
                 "input": state["question"],
@@ -307,18 +310,18 @@ class SQLAgent:
                 "table_info": self.get_table_info(),
             }
         )
-        result = self.invoke_prompt(prompt)
+        result = self.invoke_prompt(prompt)  # type: ignore
 
-        res = {
+        res = {  # type: ignore
             **state,
-            "feedback": result.content,
+            "feedback": result.content,  # type: ignore
             "messages": [*state.get("messages", []), *prompt.messages, result],
         }
-        return res
+        return res  # type: ignore
 
     def rewrite_query(self, state: State) -> State:
         """Rewrite SQL query if necessary."""
-        prompt = REWRITE_QUERY_PROMPT.invoke(
+        prompt: Any = REWRITE_QUERY_PROMPT.invoke(  # type: ignore
             {
                 "dialect": self.db.dialect,
                 "input": state["question"],
@@ -328,9 +331,9 @@ class SQLAgent:
                 "table_info": self.get_table_info(),
             }
         )
-        result = self.invoke_prompt(prompt)
+        result = self.invoke_prompt(prompt)  # type: ignore
 
-        rewritten_query = self.parse_query(result)
+        rewritten_query = self.parse_query(result)  # type: ignore
 
         return {
             **state,
@@ -341,14 +344,14 @@ class SQLAgent:
 
     def should_continue(self, state: State) -> Literal[END, "rewrite_query"]:  # type: ignore
         """Determine if the agent should continue based on the result."""
-        if state["messages"] and isinstance(state["messages"][-1], BaseMessage):
+        if state["messages"] and isinstance(state["messages"][-1], BaseMessage):  # type: ignore
             last_message = state["messages"][-1]
-            if "THE QUERY IS CORRECT" in last_message.content:
-                if "THE QUERY IS INCORRECT" in last_message.content:
+            if "THE QUERY IS CORRECT" in last_message.content:  # type: ignore
+                if "THE QUERY IS INCORRECT" in last_message.content:  # type: ignore
                     # Both correct and incorrect messages found
                     # See which is the last one
-                    correct_index = last_message.content.rfind("THE QUERY IS CORRECT")
-                    incorrect_index = last_message.content.rfind("THE QUERY IS INCORRECT")
+                    correct_index = last_message.content.rfind("THE QUERY IS CORRECT")  # type: ignore
+                    incorrect_index = last_message.content.rfind("THE QUERY IS INCORRECT")  # type: ignore
                     if correct_index > incorrect_index:
                         return END
                 else:
@@ -361,21 +364,21 @@ class SQLAgent:
 
     def graph(self) -> CompiledStateGraph[State]:
         builder = StateGraph(State)
-        builder.add_node(self.write_query)
-        builder.add_node(self.execute_query)
-        builder.add_node(self.check_query)
-        builder.add_node(self.rewrite_query)
+        builder.add_node(self.write_query)  # type: ignore
+        builder.add_node(self.execute_query)  # type: ignore
+        builder.add_node(self.check_query)  # type: ignore
+        builder.add_node(self.rewrite_query)  # type: ignore
 
         builder.add_edge(START, "write_query")
         builder.add_edge("write_query", "execute_query")
         builder.add_edge("execute_query", "check_query")
         builder.add_conditional_edges(
             "check_query",
-            self.should_continue,
+            self.should_continue,  # type: ignore
         )
         builder.add_edge("rewrite_query", "execute_query")
 
-        return builder.compile()
+        return builder.compile()  # type: ignore
 
 
 def evaluate_query(query: str, ground_truth: str, database: str, raise_on_error: bool = True) -> float:
@@ -410,7 +413,7 @@ def evaluate_query(query: str, ground_truth: str, database: str, raise_on_error:
             return 0.0
 
 
-class LitSQLAgent(agentlightning.LitAgent):
+class LitSQLAgent(agl.LitAgent[Dict[str, Any]]):
 
     def __init__(
         self,
@@ -427,20 +430,21 @@ class LitSQLAgent(agentlightning.LitAgent):
         self.table_info_truncate = table_info_truncate
         self.execution_truncate = execution_truncate
 
-    def _execute_rollout(
-        self, sample: dict[str, Any], *, resources: agentlightning.NamedResources, rollout_id: str, is_training: bool
+    def rollout(
+        self,
+        task: Dict[str, Any],
+        resources: agl.NamedResources,
+        rollout: agl.Rollout,
     ) -> float | None:
-        question = sample["question"]
+        question = task["question"]
         start_time = time.time()
-        llm: agentlightning.LLM = resources["main_llm"]
+        llm: agl.LLM = cast(agl.LLM, resources["main_llm"])
 
-        if is_training:
-            original_db_path = os.path.join(self.spider_dir, "database", sample["db_id"], sample["db_id"] + ".sqlite")
+        if rollout.mode == "train":
+            original_db_path = os.path.join(self.spider_dir, "database", task["db_id"], task["db_id"] + ".sqlite")
         else:
-            original_db_path = os.path.join(
-                self.spider_dir, "test_database", sample["db_id"], sample["db_id"] + ".sqlite"
-            )
-        ground_truth = sample["query"]
+            original_db_path = os.path.join(self.spider_dir, "test_database", task["db_id"], task["db_id"] + ".sqlite")
+        ground_truth = task["query"]
 
         if not os.path.exists(original_db_path):
             logger.error(f"Database {original_db_path} does not exist. Skipping.")
@@ -453,6 +457,8 @@ class LitSQLAgent(agentlightning.LitAgent):
         else:
             logger.error("Schema file not found: %s", schema_path)
             schema = "No schema available."
+
+        rollout_id = rollout.rollout_id
 
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = os.path.join(temp_dir, os.path.basename(original_db_path))
@@ -468,10 +474,10 @@ class LitSQLAgent(agentlightning.LitAgent):
                 execution_truncate=self.execution_truncate,
                 debug=False,
                 db_schema=schema,
-                endpoint=llm.endpoint,
+                endpoint=llm.get_base_url(rollout.rollout_id, rollout.attempt.attempt_id),  # type: ignore
                 verl_replacement=(
                     {"model": llm.model, **llm.sampling_parameters}
-                    if is_training
+                    if rollout.mode == "train"
                     else {
                         "model": llm.model,
                         "temperature": (
@@ -483,9 +489,11 @@ class LitSQLAgent(agentlightning.LitAgent):
                 ),
             ).graph()
             try:
-                result = agent.invoke(
-                    {"question": question},
-                    {"callbacks": [self.tracer.get_langchain_callback_handler()], "recursion_limit": 100},
+                # Required to make the langchain tracing work
+                handler = self.tracer.get_langchain_handler()
+                result = agent.invoke(  # type: ignore
+                    {"question": question},  # type: ignore
+                    {"callbacks": [handler] if handler else [], "recursion_limit": 100},
                 )
             except Exception as e:
                 logger.exception(f"[Rollout {rollout_id}] Error during agent invocation: {e}")
@@ -511,42 +519,27 @@ class LitSQLAgent(agentlightning.LitAgent):
 
         return reward
 
-    def training_rollout(self, task: Any, rollout_id: str, resources: agentlightning.NamedResources) -> Any:
-        return self._execute_rollout(task, resources=resources, rollout_id=rollout_id, is_training=True)
 
-    def validation_rollout(self, task: Any, rollout_id: str, resources: agentlightning.NamedResources) -> Any:
-        return self._execute_rollout(task, resources=resources, rollout_id=rollout_id, is_training=False)
-
-
-def spider_dev_data():
-    # Read from dev.parquet
-    import pandas as pd
-
+def debug_sql_agent():
     spider_dev_data_path = os.path.join(os.environ.get("VERL_SPIDER_DATA_DIR", "data"), "dev.parquet")
     if not os.path.exists(spider_dev_data_path):
         raise FileNotFoundError(f"Spider dev data file {spider_dev_data_path} does not exist.")
-    df = pd.read_parquet(spider_dev_data_path)
-    if "OPENAI_API_BASE" not in os.environ:
-        logger.warning(
-            "Environment variable OPENAI_API_BASE is not set. Using default value 'https://api.openai.com/v1'."
-        )
-        openai_api_base = "https://api.openai.com/v1"
-    else:
-        openai_api_base = os.environ["OPENAI_API_BASE"]
+    df = pd.read_parquet(spider_dev_data_path).head(10)  # type: ignore
+    df = cast(List[Dict[str, Any]], df.to_dict(orient="records"))  # type: ignore
+    print("Debug data:", df)
 
-    resource = {
-        "main_llm": agentlightning.LLM(
-            model="gpt-4.1-nano",
-            endpoint=openai_api_base,
-            sampling_parameters={
-                "temperature": 0.0,
-            },
-        )
-    }
-    return agentlightning.DevTaskLoader(df.head(10).to_dict(orient="records"), resource)
+    trainer = agl.Trainer(
+        n_workers=1,
+        initial_resources={
+            "main_llm": agl.LLM(
+                endpoint=os.environ["OPENAI_API_BASE"],
+                model="gpt-4.1-nano",
+                sampling_parameters={"temperature": 0.7},
+            )
+        },
+    )
+    trainer.dev(LitSQLAgent(), df)
 
 
 if __name__ == "__main__":
-    dotenv.load_dotenv()
-    agent, trainer = agentlightning.lightning_cli(LitSQLAgent, agentlightning.Trainer)
-    trainer.fit(agent, os.environ["VERL_API_BASE"], spider_dev_data())
+    debug_sql_agent()

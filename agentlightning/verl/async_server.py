@@ -1,11 +1,16 @@
-import ray
+# Copyright (c) Microsoft. All rights reserved.
+
+# type: ignore
+
 from copy import deepcopy
 
-from agentlightning.instrumentation.vllm import instrument_vllm, ChatCompletionResponsePatched
+import ray
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse
 from verl.workers.rollout.vllm_rollout.vllm_async_server import AsyncvLLMServer
+from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse
+
+from agentlightning.instrumentation.vllm import ChatCompletionResponsePatched, instrument_vllm
 
 
 def _unwrap_ray_remote(cls):
@@ -27,7 +32,7 @@ class PatchedvLLMServer(_unwrap_ray_remote(AsyncvLLMServer)):
     async def chat_completion(self, raw_request: Request):
         """OpenAI-compatible HTTP endpoint.
 
-        API reference: https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html
+        API reference: [OpenAI-compatible server documentation](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html)
         """
         request_json = await raw_request.json()
         request = ChatCompletionRequest(**request_json)

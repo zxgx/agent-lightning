@@ -1,3 +1,7 @@
-from .base import BaseTracer
+# Copyright (c) Microsoft. All rights reserved.
+
 from .agentops import AgentOpsTracer
-from .triplet import TripletExporter
+from .base import Tracer
+from .otel import OtelTracer
+
+__all__ = ["AgentOpsTracer", "Tracer", "OtelTracer"]

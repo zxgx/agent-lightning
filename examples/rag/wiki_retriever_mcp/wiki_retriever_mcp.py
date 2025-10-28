@@ -1,7 +1,12 @@
-import faiss
-from sentence_transformers import SentenceTransformer
+# Copyright (c) Microsoft. All rights reserved.
+
+# type: ignore
+
 import pickle
+
+import faiss
 from fastmcp import FastMCP
+from sentence_transformers import SentenceTransformer
 
 # index = faiss.read_index("/mnt/input/agent_lightning/nq_hnsw_faiss_n32e40.index")
 index = faiss.read_index("nq_hnsw_faiss_n32e40.index")
