@@ -2,15 +2,16 @@ import asyncio
 import json
 import os
 import platform
+from typing import Any, Dict, Literal, Optional
 
 if platform.system() == "Linux":
     import resource
 
-from typing import Any, Dict, Literal, Optional
+import logging
 
-from evaluation import evaluate
 from swebench.harness.utils import load_swebench_dataset
 from utils.claude_code_controller import ClaudeController
+from utils.evaluation import evaluate
 from utils.logger import logger
 
 from agentlightning import (
@@ -123,7 +124,7 @@ class CodingAgent(LitAgent):
         if result is None:
             return reward
 
-        report = result[0]
+        report = result[1]
         # resolved/unresolved patch
         if report[instance_id]["resolved"]:
             reward = 1.0
@@ -243,11 +244,87 @@ def cc_agent_dry_run_dataset():
     trainer.dev(CodingAgent(), dataset)
 
 
+async def gold_cc_agent_run_dataset(
+    sonnet_name="claude-sonnet-4-5-20250929",
+    haiku_name="claude-haiku-4-5-20251001",
+    dataset_path="swe_debug.jsonl",
+    output_dir="gold_logs",
+):
+    """Run a dry run of the cc agent on a single sample.
+
+    This is a simple test function that runs the math agent on the first 4 problems
+    using a single worker. Useful for testing the setup and configuration.
+    """
+    dataset = load_dataset(dataset_path)
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+
+    tracer = OtelTracer()
+    runner = LitAgentRunner(tracer)
+    store = InMemoryLightningStore()
+
+    llm_proxy = LLMProxy(
+        port=12358,
+        litellm_config={
+            "general_settings": {
+                "master_key": os.environ.get("ANTHROPIC_AUTH_TOKEN", "dummy"),
+            }
+        },
+    )
+    llm_proxy.set_store(store)
+
+    model_list = [
+        {
+            "model_name": f"{sonnet_name}",
+            "litellm_params": {"model": f"anthropic/{sonnet_name}", "api_key": "os.environ/ANTHROPIC_API_KEY"},
+        },
+        {
+            "model_name": f"{haiku_name}",
+            "litellm_params": {"model": f"anthropic/{haiku_name}", "api_key": "os.environ/ANTHROPIC_API_KEY"},
+        },
+    ]
+
+    llm_proxy.update_model_list(model_list)
+    # Restart the LLM proxy after backend model list update
+    # If LLM proxy has never been started, it will be started
+    llm_proxy.restart()
+
+    # Put the LLM proxy address into the store as an address
+    await store.add_resources(
+        {
+            "llm": llm_proxy.as_resource(model="local"),
+        }
+    )
+
+    for each in dataset:
+        if each["instance_id"] not in ["django__django-16899"]:
+            continue
+
+        with runner.run_context(agent=CodingAgent(), store=store):
+            rollout = await runner.step(each)
+            spans = await store.query_spans(rollout.rollout_id)
+
+        logging.info(f"instance {each['instance_id']} dump {len(spans)} spans to {output_dir}")
+        with open(os.path.join(output_dir, f"{each['instance_id']}.json"), "w") as f:
+            for span in spans:
+                f.write(json.dumps(span.model_dump()) + "\n")
+
+
 if __name__ == "__main__":
-    configure_logger()
+    configure_logger(name="cc_agent")
+
+    # asyncio.run(
+    #     cc_agent_dry_run_sample(
+    #         model_path="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    #         server_address="http://GCRAZGDL1513.westus3.cloudapp.azure.com:8000/v1",
+    #     )
+    # )
+
     asyncio.run(
-        cc_agent_dry_run_sample(
-            model_path="Qwen/Qwen3-Coder-30B-A3B-Instruct",
-            server_address="http://GCRAZGDL1513.westus3.cloudapp.azure.com:8000/v1",
+        gold_cc_agent_run_dataset(
+            sonnet_name="claude-sonnet-4-5-20250929",
+            haiku_name="claude-haiku-4-5-20251001",
+            dataset_path="swe_bench_verified.jsonl",
+            output_dir="gold_logs",
         )
     )
