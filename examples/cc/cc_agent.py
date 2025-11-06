@@ -2,12 +2,11 @@ import asyncio
 import json
 import os
 import platform
+import time
 from typing import Any, Dict, Literal, Optional
 
 if platform.system() == "Linux":
     import resource
-
-import logging
 
 from swebench.harness.utils import load_swebench_dataset
 from utils.claude_code_controller import ClaudeController
@@ -259,6 +258,8 @@ async def gold_cc_agent_run_dataset(
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
 
+    logging = configure_logger(name="cc_agent")
+
     tracer = OtelTracer()
     runner = LitAgentRunner(tracer)
     store = InMemoryLightningStore()
@@ -297,9 +298,6 @@ async def gold_cc_agent_run_dataset(
     )
 
     for each in dataset:
-        if each["instance_id"] not in ["django__django-16899"]:
-            continue
-
         with runner.run_context(agent=CodingAgent(), store=store):
             rollout = await runner.step(each)
             spans = await store.query_spans(rollout.rollout_id)
@@ -309,10 +307,10 @@ async def gold_cc_agent_run_dataset(
             for span in spans:
                 f.write(json.dumps(span.model_dump()) + "\n")
 
+        time.sleep(2 * 60)
+
 
 if __name__ == "__main__":
-    configure_logger(name="cc_agent")
-
     # asyncio.run(
     #     cc_agent_dry_run_sample(
     #         model_path="Qwen/Qwen3-Coder-30B-A3B-Instruct",
@@ -324,7 +322,7 @@ if __name__ == "__main__":
         gold_cc_agent_run_dataset(
             sonnet_name="claude-sonnet-4-5-20250929",
             haiku_name="claude-haiku-4-5-20251001",
-            dataset_path="swe_bench_verified.jsonl",
+            dataset_path="swe_debug.jsonl",
             output_dir="gold_logs",
         )
     )
