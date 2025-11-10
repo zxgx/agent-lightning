@@ -528,12 +528,13 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         
         # Check if it's a chat completions or messages endpoint
-        is_openai = "v1/chat/completions" in request.url.path
-        is_anthropic = "v1/messages" in request.url.path
+        is_openai = "chat/completions" in request.url.path
+        is_anthropic = "/messages" in request.url.path or "v1/messages" in request.url.path
         
         if not (is_openai or is_anthropic):
             return await call_next(request)
-
+        
+        # Read the request body
         try:
             json_body = await request.json()
         except json.JSONDecodeError:
@@ -545,7 +546,7 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         if not is_streaming:
             return await call_next(request)
         
-                # Store original values
+        # Store original values
         original_model = json_body.get("model", "unknown")
         
         # Convert to non-streaming request
@@ -590,15 +591,11 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
                 
                 # Determine API format and extract content
                 if is_anthropic:
-                    # Anthropic format
+                    # Anthropic format - handle multiple content blocks (text + tool_use)
                     content_blocks = response_json.get("content", [])
-                    if content_blocks and isinstance(content_blocks, list):
-                        content = content_blocks[0].get("text", "") if content_blocks else ""
-                    else:
-                        content = ""
                     
                     return StreamingResponse(
-                        self.anthropic_stream_generator(content, response_json),
+                        self.anthropic_stream_generator(content_blocks, response_json),
                         media_type="text/event-stream",
                         headers={
                             "Cache-Control": "no-cache",
@@ -632,14 +629,8 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         
         return response
     
-    async def anthropic_stream_generator(self, content: str, original_response: dict):
-        """Generate Anthropic SSE-formatted chunks from complete content
-        
-        This is a dirty hack to simulate Anthropic's streaming format based on
-        their API responses, finishing at: 2025-11-06. 
-        The actual format may subject to change by Anthropic in the future.
-        If so, consider using MessageInspectionMiddleware to inspect the update and fix accordingly.
-        """
+    async def anthropic_stream_generator(self, content_blocks: list, original_response: dict):
+        """Generate Anthropic SSE-formatted chunks from complete content blocks"""
         message_id = original_response.get("id", f"msg_{int(time.time() * 1000)}")
         model = original_response.get("model", "claude")
         
@@ -659,50 +650,103 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         }
         yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
         
-        # Send content_block_start event
-        content_block_start = {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {
-                "type": "text",
-                "text": ""
-            }
-        }
-        yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
-        
         # Send ping to keep connection alive
         ping = {"type": "ping"}
         yield f"event: ping\ndata: {json.dumps(ping)}\n\n"
         
-        # Stream content in chunks
-        words = content.split()
-        chunk_size = 5
-        
-        for i in range(0, len(words), chunk_size):
-            chunk_words = words[i:i + chunk_size]
-            text_chunk = ' '.join(chunk_words)
+        # Process each content block
+        for block_index, block in enumerate(content_blocks):
+            block_type = block.get("type", "text")
             
-            # Add space after chunk unless it's the last one
-            if i + chunk_size < len(words):
-                text_chunk += ' '
-            
-            content_block_delta = {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {
-                    "type": "text_delta",
-                    "text": text_chunk
+            if block_type == "text":
+                # Handle text block
+                content = block.get("text", "")
+                
+                # Send content_block_start event
+                content_block_start = {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "text",
+                        "text": ""
+                    }
                 }
-            }
-            yield f"event: content_block_delta\ndata: {json.dumps(content_block_delta)}\n\n"
-            await asyncio.sleep(0.02)
-        
-        # Send content_block_stop event
-        content_block_stop = {
-            "type": "content_block_stop",
-            "index": 0
-        }
-        yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop)}\n\n"
+                yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
+                
+                # Stream text content in chunks
+                if content:
+                    words = content.split()
+                    chunk_size = 5
+                    
+                    for i in range(0, len(words), chunk_size):
+                        chunk_words = words[i:i + chunk_size]
+                        text_chunk = ' '.join(chunk_words)
+                        
+                        # Add space after chunk unless it's the last one
+                        if i + chunk_size < len(words):
+                            text_chunk += ' '
+                        
+                        content_block_delta = {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {
+                                "type": "text_delta",
+                                "text": text_chunk
+                            }
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(content_block_delta)}\n\n"
+                        await asyncio.sleep(0.02)
+                
+                # Send content_block_stop event
+                content_block_stop = {
+                    "type": "content_block_stop",
+                    "index": block_index
+                }
+                yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop)}\n\n"
+                
+            elif block_type == "tool_use":
+                # Handle tool_use block
+                tool_name = block.get("name", "")
+                tool_input = block.get("input", {})
+                tool_id = block.get("id", f"toolu_{int(time.time() * 1000)}")
+                
+                # Send content_block_start event for tool use
+                content_block_start = {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": {}
+                    }
+                }
+                yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
+                
+                # Stream tool input as JSON string chunks
+                input_json = json.dumps(tool_input)
+                chunk_size = 20  # characters per chunk for JSON
+                
+                for i in range(0, len(input_json), chunk_size):
+                    json_chunk = input_json[i:i + chunk_size]
+                    
+                    content_block_delta = {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json_chunk
+                        }
+                    }
+                    yield f"event: content_block_delta\ndata: {json.dumps(content_block_delta)}\n\n"
+                    await asyncio.sleep(0.01)
+                
+                # Send content_block_stop event
+                content_block_stop = {
+                    "type": "content_block_stop",
+                    "index": block_index
+                }
+                yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop)}\n\n"
         
         # Send message_delta event with stop reason
         message_delta = {
@@ -712,7 +756,7 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
                 "stop_sequence": None
             },
             "usage": {
-                "output_tokens": len(content.split())  # Rough estimate
+                "output_tokens": original_response.get("usage", {}).get("output_tokens", 0)
             }
         }
         yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
