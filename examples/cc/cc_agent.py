@@ -167,6 +167,7 @@ async def cc_agent_dry_run_sample(model_path, server_address) -> None:
     using a single worker. Useful for testing the setup and configuration.
     """
     dataset = load_dataset(limit=4)
+    logging = configure_logger(name="Claude Code Agent")
 
     tracer = OtelTracer()
     runner = LitAgentRunner(tracer)
@@ -218,10 +219,12 @@ async def cc_agent_dry_run_sample(model_path, server_address) -> None:
             dataset[0],
         )
 
-        rollouts = await store.query_rollouts()
         spans = await store.query_spans(rollout.rollout_id)
         triplets = adapter.adapt(spans)
-
+        with open(f"stream_{dataset[0]['instance_id']}.json", "w") as f:
+            for span in spans:
+                f.write(json.dumps(span.model_dump()) + "\n")
+        logging.info(f"dump {len(spans)} spans, extract {len(triplets)} triplets")
 
 def cc_agent_dry_run_dataset():
     """Run a dry run of the cc agent on a small dataset.
@@ -258,7 +261,7 @@ async def gold_cc_agent_run_dataset(
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
 
-    logging = configure_logger(name="cc_agent")
+    logging = configure_logger(name="Claude Code Agent")
 
     tracer = OtelTracer()
     runner = LitAgentRunner(tracer)
@@ -311,18 +314,18 @@ async def gold_cc_agent_run_dataset(
 
 
 if __name__ == "__main__":
-    # asyncio.run(
-    #     cc_agent_dry_run_sample(
-    #         model_path="Qwen/Qwen3-Coder-30B-A3B-Instruct",
-    #         server_address="http://GCRAZGDL1513.westus3.cloudapp.azure.com:8000/v1",
-    #     )
-    # )
-
     asyncio.run(
-        gold_cc_agent_run_dataset(
-            sonnet_name="claude-sonnet-4-5-20250929",
-            haiku_name="claude-haiku-4-5-20251001",
-            dataset_path="swe_debug.jsonl",
-            output_dir="gold_logs",
+        cc_agent_dry_run_sample(
+            model_path="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            server_address="http://localhost:8000/v1",
         )
     )
+
+    # asyncio.run(
+    #     gold_cc_agent_run_dataset(
+    #         sonnet_name="claude-sonnet-4-5-20250929",
+    #         haiku_name="claude-haiku-4-5-20251001",
+    #         dataset_path="swe_debug.jsonl",
+    #         output_dir="gold_logs",
+    #     )
+    # )

@@ -11,6 +11,8 @@ import socket
 import tempfile
 import threading
 import time
+import json
+from collections import defaultdict
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, TypedDict, Union, cast
 
 import litellm
@@ -18,6 +20,7 @@ import opentelemetry.trace as trace_api
 import uvicorn
 import yaml
 from fastapi import Request, Response
+from fastapi.responses import StreamingResponse
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.opentelemetry import OpenTelemetry, OpenTelemetryConfig
 from litellm.proxy.proxy_server import app, save_worker_config  # pyright: ignore[reportUnknownVariableType]
@@ -256,13 +259,17 @@ class LightningSpanExporter(SpanExporter):
         """
         # Buffer append under lock to protect against concurrent exporters.
         with self._ensure_lock():
+            print(f">>> DEBUG: Export called with {len(spans)} spans\n")
             for span in spans:
+                span_context = span.get_span_context()
+                print(f">>> DEBUG: add new span ({span_context}) span id: {span_context.span_id} trace id: {span_context.trace_id} [{span.start_time} - {span.end_time}] (parent {span.parent.span_id if span.parent else None}):\n{span.attributes}\n")
                 self._buffer.append(span)
 
         # Run the async flush on our private loop, synchronously from caller's POV.
         async def _locked_flush():
             # Take the lock inside the coroutine to serialize with other flushes.
             with self._ensure_lock():
+                print(f">>> DEBUG: Trigger flush with buffer size {len(self._buffer)}\n")
                 return await self._maybe_flush()
 
         try:
@@ -295,6 +302,7 @@ class LightningSpanExporter(SpanExporter):
         for root_span_id in self._get_root_span_ids():
             subtree_spans = self._pop_subtrees(root_span_id)
             if not subtree_spans:
+                print(f">>> DEBUG: No spans found for root {root_span_id}\n")
                 continue
 
             store = self._store or get_active_llm_proxy().get_store()
@@ -306,12 +314,17 @@ class LightningSpanExporter(SpanExporter):
             headers_merged: Dict[str, Any] = {}
 
             for span in subtree_spans:
+                span_id = span.get_span_context().span_id
+                print(f">>> DEBUG: Processing span {span_id}, parent: {span.parent.span_id if span.parent else None}\n")
                 if span.attributes is None:
+                    print(f">>> DEBUG: No attributes found for span {span_id}\n")
                     continue
                 headers_str = span.attributes.get("metadata.requester_custom_headers")
                 if headers_str is None:
+                    print(f">>> DEBUG: No metadata.requester_custom_headers found for span {span_id}\n")
                     continue
                 if not isinstance(headers_str, str):
+                    print(f">>> DEBUG: metadata.requester_custom_headers is stored as a {type(headers_str)} instead of string: {headers_str}. Skipping the span {span_id}.\n")
                     logger.error(
                         f"metadata.requester_custom_headers is not stored as a string: {headers_str}. Skipping the span."
                     )
@@ -335,7 +348,7 @@ class LightningSpanExporter(SpanExporter):
                 headers_merged.update(cast(Dict[str, Any], headers))
 
             if not headers_merged:
-                logger.warning(f"No headers found in {len(subtree_spans)} subtree spans. Cannot log to store.")
+                logger.warning(f"No headers found in {len(subtree_spans)} subtree spans of root {root_span_id}. Cannot log to store.")
                 continue
 
             # Validate and normalize required header fields.
@@ -372,6 +385,7 @@ class LightningSpanExporter(SpanExporter):
             if span.parent is None:
                 span_context = span.get_span_context()
                 if span_context is not None:
+                    print(f">>> DEBUG: root span context:\n{span_context.span_id}\n")
                     yield span_context.span_id
 
     def _get_subtrees(self, root_span_id: int) -> Iterable[int]:
@@ -405,6 +419,7 @@ class LightningSpanExporter(SpanExporter):
             list[ReadableSpan]: Spans that were part of the subtree. Order follows buffer order.
         """
         subtree_span_ids = set(self._get_subtrees(root_span_id))
+        print(f">>> DEBUG: subtree_span_ids for root {root_span_id}:\n{subtree_span_ids}\n")
         subtree_spans: List[ReadableSpan] = []
         new_buffer: List[ReadableSpan] = []
         for span in self._buffer:
@@ -480,6 +495,283 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
 
         response = await call_next(request)
         return response
+
+
+class MessageInspectionMiddleware:
+    
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != "http":
+            await self.app(scope, receive, send)
+            return
+        
+        print(f">>> DEBUG: Received request with scope\n{scope}\n")
+
+        async def log_request():
+            message = await receive()
+            print(f">>> DEBUG: Received message ({type(message)})\n{message}\n")
+            return message
+
+        async def log_response(message):
+            print(f">>> DEBUG: Sending message ({type(message)})\n{message}\n")
+            await send(message)
+
+        await self.app(scope, log_request, log_response)
+
+
+class StreamConversionMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Only process POST requests to completion endpoints
+        if request.method != "POST":
+            return await call_next(request)
+        
+        # Check if it's a chat completions or messages endpoint
+        is_openai = "v1/chat/completions" in request.url.path
+        is_anthropic = "v1/messages" in request.url.path
+        
+        if not (is_openai or is_anthropic):
+            return await call_next(request)
+
+        try:
+            json_body = await request.json()
+        except json.JSONDecodeError:
+            return await call_next(request)
+        
+        # Check if streaming is requested
+        is_streaming = json_body.get("stream", False)
+        
+        if not is_streaming:
+            return await call_next(request)
+        
+                # Store original values
+        original_model = json_body.get("model", "unknown")
+        
+        # Convert to non-streaming request
+        json_body["stream"] = False
+        modified_body = json.dumps(json_body).encode()
+        
+        # Create a new scope with modified body
+        async def receive():
+            return {
+                "type": "http.request",
+                "body": modified_body,
+                "more_body": False
+            }
+
+        # Create new scope
+        scope = request.scope.copy()
+        scope["headers"] = [
+            (k, v) for k, v in request.scope["headers"]
+            if k.lower() != b"content-length"
+        ]
+        # Add correct content-length
+        scope["headers"].append((b"content-length", str(len(modified_body)).encode()))
+        
+        # Create a modified request
+        modified_request = Request(scope, receive=receive)
+        
+        # Store the modified request in the original request's state
+        request._body = modified_body
+        
+        # Call the next handler with modified request
+        response = await call_next(modified_request)
+        
+        # If response is successful, convert to streaming
+        if response.status_code == 200:
+            # Read the response body
+            response_body = b""
+            async for chunk in response.body_iterator:
+                response_body += chunk
+            
+            try:
+                response_json = json.loads(response_body)
+                
+                # Determine API format and extract content
+                if is_anthropic:
+                    # Anthropic format
+                    content_blocks = response_json.get("content", [])
+                    if content_blocks and isinstance(content_blocks, list):
+                        content = content_blocks[0].get("text", "") if content_blocks else ""
+                    else:
+                        content = ""
+                    
+                    return StreamingResponse(
+                        self.anthropic_stream_generator(content, response_json),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no"
+                        }
+                    )
+                else:
+                    # OpenAI format
+                    content = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    
+                    return StreamingResponse(
+                        self.openai_stream_generator(content, original_model),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no"
+                        }
+                    )
+                    
+            except Exception as e:
+                print(f"Error converting to stream: {e}")
+                import traceback
+                traceback.print_exc()
+                return Response(
+                    content=response_body,
+                    status_code=response.status_code,
+                    headers=dict(response.headers)
+                )
+        
+        return response
+    
+    async def anthropic_stream_generator(self, content: str, original_response: dict):
+        """Generate Anthropic SSE-formatted chunks from complete content
+        
+        This is a dirty hack to simulate Anthropic's streaming format based on
+        their API responses, finishing at: 2025-11-06. 
+        The actual format may subject to change by Anthropic in the future.
+        If so, consider using MessageInspectionMiddleware to inspect the update and fix accordingly.
+        """
+        message_id = original_response.get("id", f"msg_{int(time.time() * 1000)}")
+        model = original_response.get("model", "claude")
+        
+        # Send message_start event
+        message_start = {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": original_response.get("usage", {"input_tokens": 0, "output_tokens": 0})
+            }
+        }
+        yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+        
+        # Send content_block_start event
+        content_block_start = {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "text",
+                "text": ""
+            }
+        }
+        yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
+        
+        # Send ping to keep connection alive
+        ping = {"type": "ping"}
+        yield f"event: ping\ndata: {json.dumps(ping)}\n\n"
+        
+        # Stream content in chunks
+        words = content.split()
+        chunk_size = 5
+        
+        for i in range(0, len(words), chunk_size):
+            chunk_words = words[i:i + chunk_size]
+            text_chunk = ' '.join(chunk_words)
+            
+            # Add space after chunk unless it's the last one
+            if i + chunk_size < len(words):
+                text_chunk += ' '
+            
+            content_block_delta = {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "text_delta",
+                    "text": text_chunk
+                }
+            }
+            yield f"event: content_block_delta\ndata: {json.dumps(content_block_delta)}\n\n"
+            await asyncio.sleep(0.02)
+        
+        # Send content_block_stop event
+        content_block_stop = {
+            "type": "content_block_stop",
+            "index": 0
+        }
+        yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop)}\n\n"
+        
+        # Send message_delta event with stop reason
+        message_delta = {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": original_response.get("stop_reason", "end_turn"),
+                "stop_sequence": None
+            },
+            "usage": {
+                "output_tokens": len(content.split())  # Rough estimate
+            }
+        }
+        yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
+        
+        # Send message_stop event
+        message_stop = {"type": "message_stop"}
+        yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
+    
+    async def openai_stream_generator(self, content: str, model: str):
+        """Generate OpenAI SSE-formatted chunks from complete content"""
+        words = content.split()
+        chunk_size = 5
+        
+        chunks = []
+        for i in range(0, len(words), chunk_size):
+            chunk_words = words[i:i + chunk_size]
+            chunks.append(' '.join(chunk_words))
+        
+        # Stream chunks
+        for i, chunk in enumerate(chunks):
+            delta = {
+                "id": f"chatcmpl-{int(time.time() * 1000)}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant" if i == 0 else None,
+                            "content": chunk + (" " if i < len(chunks) - 1 else "")
+                        },
+                        "finish_reason": None
+                    }
+                ]
+            }
+            
+            if delta["choices"][0]["delta"]["role"] is None:
+                del delta["choices"][0]["delta"]["role"]
+            
+            yield f"data: {json.dumps(delta)}\n\n"
+            await asyncio.sleep(0.02)
+        
+        # Send final chunk
+        final_chunk = {
+            "id": f"chatcmpl-{int(time.time() * 1000)}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }
+            ]
+        }
+        yield f"data: {json.dumps(final_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
 
 
 class LLMProxy:
@@ -639,6 +931,8 @@ class LLMProxy:
             # Fallback to adding a new middleware
             logger.info("Adding a new middleware to the FastAPI app.")
             app.add_middleware(RolloutAttemptMiddleware)
+
+        app.add_middleware(StreamConversionMiddleware)
 
         if not initialize_llm_callbacks(self._add_return_token_ids):
             # If it's not the first time to initialize the callbacks, also

@@ -184,7 +184,7 @@ agents = [
 ]
 
 [tool.uv]
-required-version = ">=0.9.5"
+required-version = ">=0.9.4"
 conflicts = [
   [
     { group = "core-legacy" },
