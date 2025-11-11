@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import json
-from collections import defaultdict
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, TypedDict, Union, cast
 
 import litellm
@@ -259,17 +259,13 @@ class LightningSpanExporter(SpanExporter):
         """
         # Buffer append under lock to protect against concurrent exporters.
         with self._ensure_lock():
-            print(f">>> DEBUG: Export called with {len(spans)} spans\n")
             for span in spans:
-                span_context = span.get_span_context()
-                print(f">>> DEBUG: add new span ({span_context}) span id: {span_context.span_id} trace id: {span_context.trace_id} [{span.start_time} - {span.end_time}] (parent {span.parent.span_id if span.parent else None}):\n{span.attributes}\n")
                 self._buffer.append(span)
 
         # Run the async flush on our private loop, synchronously from caller's POV.
         async def _locked_flush():
             # Take the lock inside the coroutine to serialize with other flushes.
             with self._ensure_lock():
-                print(f">>> DEBUG: Trigger flush with buffer size {len(self._buffer)}\n")
                 return await self._maybe_flush()
 
         try:
@@ -302,7 +298,6 @@ class LightningSpanExporter(SpanExporter):
         for root_span_id in self._get_root_span_ids():
             subtree_spans = self._pop_subtrees(root_span_id)
             if not subtree_spans:
-                print(f">>> DEBUG: No spans found for root {root_span_id}\n")
                 continue
 
             store = self._store or get_active_llm_proxy().get_store()
@@ -314,17 +309,12 @@ class LightningSpanExporter(SpanExporter):
             headers_merged: Dict[str, Any] = {}
 
             for span in subtree_spans:
-                span_id = span.get_span_context().span_id
-                print(f">>> DEBUG: Processing span {span_id}, parent: {span.parent.span_id if span.parent else None}\n")
                 if span.attributes is None:
-                    print(f">>> DEBUG: No attributes found for span {span_id}\n")
                     continue
                 headers_str = span.attributes.get("metadata.requester_custom_headers")
                 if headers_str is None:
-                    print(f">>> DEBUG: No metadata.requester_custom_headers found for span {span_id}\n")
                     continue
                 if not isinstance(headers_str, str):
-                    print(f">>> DEBUG: metadata.requester_custom_headers is stored as a {type(headers_str)} instead of string: {headers_str}. Skipping the span {span_id}.\n")
                     logger.error(
                         f"metadata.requester_custom_headers is not stored as a string: {headers_str}. Skipping the span."
                     )
@@ -385,7 +375,6 @@ class LightningSpanExporter(SpanExporter):
             if span.parent is None:
                 span_context = span.get_span_context()
                 if span_context is not None:
-                    print(f">>> DEBUG: root span context:\n{span_context.span_id}\n")
                     yield span_context.span_id
 
     def _get_subtrees(self, root_span_id: int) -> Iterable[int]:
@@ -419,7 +408,6 @@ class LightningSpanExporter(SpanExporter):
             list[ReadableSpan]: Spans that were part of the subtree. Order follows buffer order.
         """
         subtree_span_ids = set(self._get_subtrees(root_span_id))
-        print(f">>> DEBUG: subtree_span_ids for root {root_span_id}:\n{subtree_span_ids}\n")
         subtree_spans: List[ReadableSpan] = []
         new_buffer: List[ReadableSpan] = []
         for span in self._buffer:
@@ -452,6 +440,18 @@ class LightningOpenTelemetry(OpenTelemetry):
 
         super().__init__(config=config)  # pyright: ignore[reportUnknownMemberType]
 
+    async def async_pre_call_deployment_hook(self, kwargs: Dict[str, Any], call_type: Optional[CallTypes] = None) -> Optional[Dict[str, Any]]:
+        if "metadata" not in kwargs or "litellm_parent_otel_span" not in kwargs["metadata"]:
+            parent_otel_span = self.create_litellm_proxy_request_started_span(  # type: ignore
+                start_time=datetime.now(),
+                headers=kwargs.get("headers", {}),
+            )
+            updated_metadata = {**kwargs.get("metadata", {}), "litellm_parent_otel_span": parent_otel_span}
+            
+            return {**kwargs, "metadata": updated_metadata}
+        else:
+            return kwargs
+ 
 
 class RolloutAttemptMiddleware(BaseHTTPMiddleware):
     """
@@ -529,7 +529,7 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         
         # Check if it's a chat completions or messages endpoint
         is_openai = "chat/completions" in request.url.path
-        is_anthropic = "/messages" in request.url.path or "v1/messages" in request.url.path
+        is_anthropic = "/messages" in request.url.path
         
         if not (is_openai or is_anthropic):
             return await call_next(request)
@@ -630,7 +630,12 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         return response
     
     async def anthropic_stream_generator(self, content_blocks: list, original_response: dict):
-        """Generate Anthropic SSE-formatted chunks from complete content blocks"""
+        """Generate Anthropic SSE-formatted chunks from complete content blocks
+        
+        This is a dirty hack for Anthropic-style streaming from non-streaming response.
+        The sse format is subject to change based on Anthropic's implementation. 
+        If so, try to use `MessageInspectionMiddleware` to inspect the update and fix accordingly.
+        """
         message_id = original_response.get("id", f"msg_{int(time.time() * 1000)}")
         model = original_response.get("model", "claude")
         
@@ -766,56 +771,13 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
     
     async def openai_stream_generator(self, content: str, model: str):
-        """Generate OpenAI SSE-formatted chunks from complete content"""
-        words = content.split()
-        chunk_size = 5
+        """Generate OpenAI SSE-formatted chunks from complete content
         
-        chunks = []
-        for i in range(0, len(words), chunk_size):
-            chunk_words = words[i:i + chunk_size]
-            chunks.append(' '.join(chunk_words))
-        
-        # Stream chunks
-        for i, chunk in enumerate(chunks):
-            delta = {
-                "id": f"chatcmpl-{int(time.time() * 1000)}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {
-                            "role": "assistant" if i == 0 else None,
-                            "content": chunk + (" " if i < len(chunks) - 1 else "")
-                        },
-                        "finish_reason": None
-                    }
-                ]
-            }
-            
-            if delta["choices"][0]["delta"]["role"] is None:
-                del delta["choices"][0]["delta"]["role"]
-            
-            yield f"data: {json.dumps(delta)}\n\n"
-            await asyncio.sleep(0.02)
-        
-        # Send final chunk
-        final_chunk = {
-            "id": f"chatcmpl-{int(time.time() * 1000)}",
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop"
-                }
-            ]
-        }
-        yield f"data: {json.dumps(final_chunk)}\n\n"
-        yield "data: [DONE]\n\n"
+        This is a dirty hack for OpenAI-style streaming from non-streaming response.
+        The sse format is subject to change based on OpenAI's implementation. 
+        If so, try to use `MessageInspectionMiddleware` to inspect the update and fix accordingly.
+        """
+        raise NotImplementedError("OpenAI stream generator is not implemented yet.")
 
 
 class LLMProxy:

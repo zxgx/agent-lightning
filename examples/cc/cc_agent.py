@@ -45,7 +45,7 @@ class CodingAgent(LitAgent):
         namespace: Literal["swebench", "starryzhang"] = "swebench",
         full_set: Literal["princeton-nlp/SWE-bench", "SWE-bench-Live/SWE-bench-Live"] = "princeton-nlp/SWE-bench",
         split: str = "test",
-        max_step: int = 20,
+        max_step: int = 5,
         run_method: Literal["python", "cli"] = "cli",
         open_file_limit: int = 4096,
         cache_level: str = "env",  # ["none", "base", "env", "instance"]
@@ -226,25 +226,6 @@ async def cc_agent_dry_run_sample(model_path, server_address) -> None:
                 f.write(json.dumps(span.model_dump()) + "\n")
         logging.info(f"dump {len(spans)} spans, extract {len(triplets)} triplets")
 
-def cc_agent_dry_run_dataset():
-    """Run a dry run of the cc agent on a small dataset.
-
-    This is a simple test function that runs the math agent on the first 4 problems
-    using a single worker. Useful for testing the setup and configuration.
-    """
-    dataset = load_dataset(limit=4)
-    trainer = Trainer(
-        n_runners=1,
-        initial_resources={
-            "llm": LLM(
-                endpoint=os.environ["ANTHROPIC_BASE_URL"],
-                api_key=os.environ["ANTHROPIC_AUTH_TOKEN"],
-                model="local",
-            )
-        },
-    )
-    trainer.dev(CodingAgent(), dataset)
-
 
 async def gold_cc_agent_run_dataset(
     sonnet_name="claude-sonnet-4-5-20250929",
@@ -314,18 +295,25 @@ async def gold_cc_agent_run_dataset(
 
 
 if __name__ == "__main__":
-    asyncio.run(
-        cc_agent_dry_run_sample(
-            model_path="Qwen/Qwen3-Coder-30B-A3B-Instruct",
-            server_address="http://localhost:8000/v1",
-        )
-    )
+    from argparse import ArgumentParser
+    parser = ArgumentParser()
+    parser.add_argument("--official", action="store_true", help="Whether to run official claude code.")
 
-    # asyncio.run(
-    #     gold_cc_agent_run_dataset(
-    #         sonnet_name="claude-sonnet-4-5-20250929",
-    #         haiku_name="claude-haiku-4-5-20251001",
-    #         dataset_path="swe_debug.jsonl",
-    #         output_dir="gold_logs",
-    #     )
-    # )
+    args = parser.parse_args()
+
+    if not args.official:
+        asyncio.run(
+            cc_agent_dry_run_sample(
+                model_path="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                server_address="http://localhost:8000/v1",
+            )
+        )
+    else:
+        asyncio.run(
+            gold_cc_agent_run_dataset(
+                sonnet_name="claude-sonnet-4-5-20250929",
+                haiku_name="claude-haiku-4-5-20251001",
+                dataset_path="swe_debug.jsonl",
+                output_dir="gold_logs",
+            )
+        )
