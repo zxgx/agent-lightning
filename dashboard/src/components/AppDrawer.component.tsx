@@ -1,11 +1,13 @@
 // Copyright (c) Microsoft. All rights reserved.
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Editor } from '@monaco-editor/react';
 import { IconCheck, IconCopy } from '@tabler/icons-react';
 import type { DataTableSortStatus } from 'mantine-datatable';
+import { createSearchParams, Link, useInRouterContext, useLocation } from 'react-router-dom';
 import {
   ActionIcon,
+  Anchor,
   Badge,
   Box,
   CopyButton,
@@ -269,7 +271,7 @@ export function JsonEditor({ value }: JsonEditorProps) {
   const editorTheme = colorScheme === 'dark' ? 'vs-dark' : 'vs-light';
 
   return (
-    <Box style={{ flex: 1, minHeight: 0 }}>
+    <Box data-testid='json-editor-container' style={{ flex: 1, minHeight: 0 }}>
       <Editor
         height='100%'
         language='json'
@@ -322,6 +324,15 @@ function RolloutTracesDrawerBody({ rollout, attempt, onShowRollout, onShowSpanDe
   const { data, isFetching, isError, error, refetch } = useGetSpansQuery(queryArgs);
   const spans = data?.items ?? [];
   const totalRecords = data?.total ?? 0;
+  const tracesLinkSearch = useMemo(() => {
+    const params = createSearchParams({
+      rolloutId: rollout.rolloutId,
+      ...(attempt?.attemptId ? { attemptId: attempt.attemptId } : {}),
+    });
+    return params.toString();
+  }, [attempt?.attemptId, rollout.rolloutId]);
+  const tracesLinkHref = tracesLinkSearch ? `/traces?${tracesLinkSearch}` : '/traces';
+  const isWithinRouter = useInRouterContext();
 
   const handleSortStatusChange = useCallback((status: DataTableSortStatus<TracesTableRecord>) => {
     setSort({
@@ -341,11 +352,38 @@ function RolloutTracesDrawerBody({ rollout, attempt, onShowRollout, onShowSpanDe
 
   return (
     <Stack gap='md' style={{ flex: 1, minHeight: 0 }}>
-      <Text size='sm' c='dimmed'>
-        Showing spans for rollout {rollout.rolloutId}
-        {attempt ? ` · Attempt ${attempt.sequenceId} (${attempt.attemptId})` : ' · Latest attempt'}
-      </Text>
-      <Box style={{ flex: 1, minHeight: 0 }}>
+      <Group justify='space-between' align='center' gap='sm' wrap='nowrap'>
+        <Text size='sm' style={{ flex: 1, minWidth: 0 }}>
+          Showing spans for{' '}
+          <Text component='span' fw={600}>
+            {rollout.rolloutId}
+            {attempt ? ` · Attempt ${attempt.sequenceId} (${attempt.attemptId})` : ' · Latest attempt'}
+          </Text>
+        </Text>
+        {isWithinRouter ? (
+          <Anchor
+            component={Link}
+            to={tracesLinkHref}
+            size='sm'
+            aria-label={`Open traces page for rollout ${rollout.rolloutId}${
+              attempt ? ` attempt ${attempt.sequenceId}` : ''
+            }`}
+          >
+            View full traces
+          </Anchor>
+        ) : (
+          <Anchor
+            href={tracesLinkHref}
+            size='sm'
+            aria-label={`Open traces page for rollout ${rollout.rolloutId}${
+              attempt ? ` attempt ${attempt.sequenceId}` : ''
+            }`}
+          >
+            View full traces
+          </Anchor>
+        )}
+      </Group>
+      <Box data-testid='traces-drawer-table-container' style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
         <TracesTable
           spans={spans}
           totalRecords={totalRecords}
@@ -374,10 +412,16 @@ export function AppDrawerContainer() {
   const dispatch = useAppDispatch();
   const isOpen = useAppSelector(selectDrawerIsOpen);
   const content = useAppSelector(selectDrawerContent);
+  const isRouterAvailable = useInRouterContext();
 
   const handleClose = useCallback(() => {
     dispatch(closeDrawer());
   }, [dispatch]);
+  const handleNavigation = useCallback(() => {
+    if (isOpen) {
+      dispatch(closeDrawer());
+    }
+  }, [dispatch, isOpen]);
 
   const derivedContent = useMemo(() => {
     if (!content) {
@@ -444,5 +488,29 @@ export function AppDrawerContainer() {
 
   const { title, body } = derivedContent;
 
-  return <AppDrawer opened={isOpen} onClose={handleClose} title={title} body={body} />;
+  return (
+    <>
+      {isRouterAvailable ? <DrawerLocationWatcher onNavigation={handleNavigation} /> : null}
+      <AppDrawer opened={isOpen} onClose={handleClose} title={title} body={body} />
+    </>
+  );
+}
+
+type DrawerLocationWatcherProps = {
+  onNavigation: () => void;
+};
+
+function DrawerLocationWatcher({ onNavigation }: DrawerLocationWatcherProps) {
+  const location = useLocation();
+  const lastLocationKeyRef = useRef(location.key);
+
+  useEffect(() => {
+    if (lastLocationKeyRef.current === location.key) {
+      return;
+    }
+    lastLocationKeyRef.current = location.key;
+    onNavigation();
+  }, [location.key, onNavigation]);
+
+  return null;
 }
