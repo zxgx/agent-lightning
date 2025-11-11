@@ -21,6 +21,7 @@ import anthropic
 import openai
 import pytest
 
+from agentlightning import LlmProxyTraceToTriplet
 from agentlightning.llm_proxy import LLMProxy, _reset_litellm_logging_worker  # pyright: ignore[reportPrivateUsage]
 from agentlightning.store.memory import InMemoryLightningStore
 from agentlightning.types import LLM, Span
@@ -378,5 +379,54 @@ async def test_streaming_chunks(qwen25_model: RemoteOpenAIServer):
         spans = await store.query_spans(rollout.rollout_id, rollout.attempt.attempt_id)
         assert len(spans) > 0
         # TODO: didn't test the token ids in streaming chunks here
+    finally:
+        proxy.stop()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_token_ids(qwen25_model: RemoteOpenAIServer):
+    proxy, store = _make_proxy_and_store(qwen25_model)
+    try:
+        resource, rollout = await _new_resource(proxy, store)
+        adapter = LlmProxyTraceToTriplet()
+        client = anthropic.Anthropic(base_url=resource.endpoint, api_key="token-abc123", timeout=120)
+
+        # non-stream
+        response = client.messages.create(
+            model="gpt-4o-arbitrary",
+            max_tokens=64,
+            messages=[{"role": "user", "content": "Say the word: banana"}],
+        )
+
+        txt = "".join([b.text for b in response.content if b.type == "text"])
+        assert "banana" in txt.lower(), f"Response does not contain 'banana': {txt}"
+
+        spans = await store.query_spans(rollout.rollout_id, rollout.attempt.attempt_id)
+        for i, span in enumerate(spans):
+            print(f">>> Span {i}: {span.name}, attributes: {span.attributes}")
+        assert len(spans) > 0
+
+        triplets = adapter.adapt(spans)
+        for i, triplet in enumerate(triplets):
+            print(f">>> Triplet {i}: {triplet}")
+        assert len(triplets) == 1
+
+        # stream
+        response = client.messages.create(
+            model="gpt-4o-arbitrary",
+            max_tokens=64,
+            messages=[{"role": "user", "content": "Say the word: banana"}],
+            stream=True,
+        )
+        for chunk in response:
+            print(chunk)
+        spans = await store.query_spans(rollout.rollout_id, rollout.attempt.attempt_id)
+        for i, span in enumerate(spans):
+            print(f">>> Span {i}: {span.name}, attributes: {span.attributes}")
+        assert len(spans) > 0
+        triplets = adapter.adapt(spans)
+        for i, triplet in enumerate(triplets):
+            print(f">>> Triplet {i}: {triplet}")
+        assert len(triplets) == 2
     finally:
         proxy.stop()
