@@ -94,15 +94,21 @@ const normalizeSpan = (value: unknown): Span => {
     };
   };
   const rawStatus = camelized.status ?? { status_code: 'UNSET', description: null };
-  return {
+  const result = {
     ...camelized,
     parentId: camelized.parentId ?? null,
-    attributes: camelized.attributes ?? {},
+    // The following fields does not need to be normalized to camel case
+    // For example, gen_ai.xxx should not become genAi.xxx
+    attributes: (value as any).attributes ?? {},
+    context: (value as any).context ?? {},
+    parent: (value as any).parent ?? null,
+    resource: (value as any).resource ?? {},
     status: {
       status_code: rawStatus.status_code ?? rawStatus.statusCode ?? 'UNSET',
       description: rawStatus.description ?? null,
     },
   };
+  return result;
 };
 
 const normalizeResources = (value: unknown): Resources => {
@@ -121,20 +127,20 @@ const normalizePaginatedResponse = <T>(value: unknown, normalizer: (item: unknow
     throw new Error('Expected paginated response payload');
   }
 
-  const camelized = camelCaseKeys(value) as {
+  const converted = value as {
     items?: unknown;
     limit?: number;
     offset?: number;
     total?: number;
   };
 
-  const itemsSource = Array.isArray(camelized.items) ? camelized.items : [];
+  const itemsSource = Array.isArray(converted.items) ? converted.items : [];
 
   return {
     items: itemsSource.map((item) => normalizer(item)),
-    limit: typeof camelized.limit === 'number' ? camelized.limit : itemsSource.length,
-    offset: typeof camelized.offset === 'number' ? camelized.offset : 0,
-    total: typeof camelized.total === 'number' ? camelized.total : itemsSource.length,
+    limit: typeof converted.limit === 'number' ? converted.limit : itemsSource.length,
+    offset: typeof converted.offset === 'number' ? converted.offset : 0,
+    total: typeof converted.total === 'number' ? converted.total : itemsSource.length,
   };
 };
 
