@@ -1351,6 +1351,13 @@ def initialize_llm_callbacks(callback_classes: List[Type[CustomLogger]]) -> bool
         _callbacks_before_litellm_start = [*litellm.callbacks]  # type: ignore
         return True
 
+    else:
+        # Put whatever is missing in the new callback classes to the existing callbacks.
+        for cls in callback_classes:
+            if not any(isinstance(cb, cls) for cb in _callbacks_before_litellm_start):
+                logger.info(f"Adding missing callback {cls} to the existing callbacks.")
+                _callbacks_before_litellm_start.append(cls())
+
     _reset_litellm_logging_callback_manager()
 
     if LightningOpenTelemetry in callback_classes:
