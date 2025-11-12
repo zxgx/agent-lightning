@@ -468,6 +468,9 @@ class LightningOpenTelemetry(OpenTelemetry):
     async def async_pre_call_deployment_hook(
         self, kwargs: Dict[str, Any], call_type: Optional[CallTypes] = None
     ) -> Optional[Dict[str, Any]]:
+        """The root span is sometimes missing (e.g., when Anthropic endpoint is used).
+        It is created in an auth module in LiteLLM. If it's missing, we create it here.
+        """
         if "metadata" not in kwargs or "litellm_parent_otel_span" not in kwargs["metadata"]:
             parent_otel_span = self.create_litellm_proxy_request_started_span(  # type: ignore
                 start_time=datetime.now(),
