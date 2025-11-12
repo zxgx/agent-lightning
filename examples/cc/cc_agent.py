@@ -296,6 +296,7 @@ async def gold_cc_agent_run_dataset(
 
 if __name__ == "__main__":
     from argparse import ArgumentParser
+
     parser = ArgumentParser()
     parser.add_argument("--official", action="store_true", help="Whether to run official claude code.")
 

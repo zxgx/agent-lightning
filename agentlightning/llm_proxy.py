@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import logging
 import os
 import re
@@ -11,7 +12,6 @@ import socket
 import tempfile
 import threading
 import time
-import json
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, TypedDict, Union, cast
 
@@ -338,7 +338,9 @@ class LightningSpanExporter(SpanExporter):
                 headers_merged.update(cast(Dict[str, Any], headers))
 
             if not headers_merged:
-                logger.warning(f"No headers found in {len(subtree_spans)} subtree spans of root {root_span_id}. Cannot log to store.")
+                logger.warning(
+                    f"No headers found in {len(subtree_spans)} subtree spans of root {root_span_id}. Cannot log to store."
+                )
                 continue
 
             # Validate and normalize required header fields.
@@ -440,18 +442,20 @@ class LightningOpenTelemetry(OpenTelemetry):
 
         super().__init__(config=config)  # pyright: ignore[reportUnknownMemberType]
 
-    async def async_pre_call_deployment_hook(self, kwargs: Dict[str, Any], call_type: Optional[CallTypes] = None) -> Optional[Dict[str, Any]]:
+    async def async_pre_call_deployment_hook(
+        self, kwargs: Dict[str, Any], call_type: Optional[CallTypes] = None
+    ) -> Optional[Dict[str, Any]]:
         if "metadata" not in kwargs or "litellm_parent_otel_span" not in kwargs["metadata"]:
             parent_otel_span = self.create_litellm_proxy_request_started_span(  # type: ignore
                 start_time=datetime.now(),
                 headers=kwargs.get("headers", {}),
             )
             updated_metadata = {**kwargs.get("metadata", {}), "litellm_parent_otel_span": parent_otel_span}
-            
+
             return {**kwargs, "metadata": updated_metadata}
         else:
             return kwargs
- 
+
 
 class RolloutAttemptMiddleware(BaseHTTPMiddleware):
     """
@@ -498,15 +502,15 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
 
 
 class MessageInspectionMiddleware:
-    
+
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope['type'] != "http":
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        
+
         print(f">>> DEBUG: Received request with scope\n{scope}\n")
 
         async def log_request():
@@ -526,119 +530,101 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         # Only process POST requests to completion endpoints
         if request.method != "POST":
             return await call_next(request)
-        
+
         # Check if it's a chat completions or messages endpoint
         is_openai = "chat/completions" in request.url.path
         is_anthropic = "/messages" in request.url.path
-        
+
         if not (is_openai or is_anthropic):
             return await call_next(request)
-        
+
         # Read the request body
         try:
             json_body = await request.json()
         except json.JSONDecodeError:
             return await call_next(request)
-        
+
         # Check if streaming is requested
         is_streaming = json_body.get("stream", False)
-        
+
         if not is_streaming:
             return await call_next(request)
-        
+
         # Store original values
         original_model = json_body.get("model", "unknown")
-        
+
         # Convert to non-streaming request
         json_body["stream"] = False
         modified_body = json.dumps(json_body).encode()
-        
+
         # Create a new scope with modified body
         async def receive():
-            return {
-                "type": "http.request",
-                "body": modified_body,
-                "more_body": False
-            }
+            return {"type": "http.request", "body": modified_body, "more_body": False}
 
         # Create new scope
         scope = request.scope.copy()
-        scope["headers"] = [
-            (k, v) for k, v in request.scope["headers"]
-            if k.lower() != b"content-length"
-        ]
+        scope["headers"] = [(k, v) for k, v in request.scope["headers"] if k.lower() != b"content-length"]
         # Add correct content-length
         scope["headers"].append((b"content-length", str(len(modified_body)).encode()))
-        
+
         # Create a modified request
         modified_request = Request(scope, receive=receive)
-        
+
         # Store the modified request in the original request's state
         request._body = modified_body
-        
+
         # Call the next handler with modified request
         response = await call_next(modified_request)
-        
+
         # If response is successful, convert to streaming
         if response.status_code == 200:
             # Read the response body
             response_body = b""
             async for chunk in response.body_iterator:
                 response_body += chunk
-            
+
             try:
                 response_json = json.loads(response_body)
-                
+
                 # Determine API format and extract content
                 if is_anthropic:
                     # Anthropic format - handle multiple content blocks (text + tool_use)
                     content_blocks = response_json.get("content", [])
-                    
+
                     return StreamingResponse(
                         self.anthropic_stream_generator(content_blocks, response_json),
                         media_type="text/event-stream",
-                        headers={
-                            "Cache-Control": "no-cache",
-                            "Connection": "keep-alive",
-                            "X-Accel-Buffering": "no"
-                        }
+                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                     )
                 else:
                     # OpenAI format
                     content = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    
+
                     return StreamingResponse(
                         self.openai_stream_generator(content, original_model),
                         media_type="text/event-stream",
-                        headers={
-                            "Cache-Control": "no-cache",
-                            "Connection": "keep-alive",
-                            "X-Accel-Buffering": "no"
-                        }
+                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                     )
-                    
+
             except Exception as e:
                 print(f"Error converting to stream: {e}")
                 import traceback
+
                 traceback.print_exc()
-                return Response(
-                    content=response_body,
-                    status_code=response.status_code,
-                    headers=dict(response.headers)
-                )
-        
+                return Response(content=response_body, status_code=response.status_code, headers=dict(response.headers))
+
         return response
-    
+
     async def anthropic_stream_generator(self, content_blocks: list, original_response: dict):
         """Generate Anthropic SSE-formatted chunks from complete content blocks
-        
+
         This is a dirty hack for Anthropic-style streaming from non-streaming response.
-        The sse format is subject to change based on Anthropic's implementation. 
+        The sse format is subject to change based on Anthropic's implementation.
         If so, try to use `MessageInspectionMiddleware` to inspect the update and fix accordingly.
         """
         message_id = original_response.get("id", f"msg_{int(time.time() * 1000)}")
         model = original_response.get("model", "claude")
-        
+
         # Send message_start event
         message_start = {
             "type": "message_start",
@@ -650,131 +636,106 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
                 "model": model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": original_response.get("usage", {"input_tokens": 0, "output_tokens": 0})
-            }
+                "usage": original_response.get("usage", {"input_tokens": 0, "output_tokens": 0}),
+            },
         }
         yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
-        
+
         # Send ping to keep connection alive
         ping = {"type": "ping"}
         yield f"event: ping\ndata: {json.dumps(ping)}\n\n"
-        
+
         # Process each content block
         for block_index, block in enumerate(content_blocks):
             block_type = block.get("type", "text")
-            
+
             if block_type == "text":
                 # Handle text block
                 content = block.get("text", "")
-                
+
                 # Send content_block_start event
                 content_block_start = {
                     "type": "content_block_start",
                     "index": block_index,
-                    "content_block": {
-                        "type": "text",
-                        "text": ""
-                    }
+                    "content_block": {"type": "text", "text": ""},
                 }
                 yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
-                
+
                 # Stream text content in chunks
                 if content:
                     words = content.split()
                     chunk_size = 5
-                    
+
                     for i in range(0, len(words), chunk_size):
-                        chunk_words = words[i:i + chunk_size]
-                        text_chunk = ' '.join(chunk_words)
-                        
+                        chunk_words = words[i : i + chunk_size]
+                        text_chunk = " ".join(chunk_words)
+
                         # Add space after chunk unless it's the last one
                         if i + chunk_size < len(words):
-                            text_chunk += ' '
-                        
+                            text_chunk += " "
+
                         content_block_delta = {
                             "type": "content_block_delta",
                             "index": block_index,
-                            "delta": {
-                                "type": "text_delta",
-                                "text": text_chunk
-                            }
+                            "delta": {"type": "text_delta", "text": text_chunk},
                         }
                         yield f"event: content_block_delta\ndata: {json.dumps(content_block_delta)}\n\n"
                         await asyncio.sleep(0.02)
-                
+
                 # Send content_block_stop event
-                content_block_stop = {
-                    "type": "content_block_stop",
-                    "index": block_index
-                }
+                content_block_stop = {"type": "content_block_stop", "index": block_index}
                 yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop)}\n\n"
-                
+
             elif block_type == "tool_use":
                 # Handle tool_use block
                 tool_name = block.get("name", "")
                 tool_input = block.get("input", {})
                 tool_id = block.get("id", f"toolu_{int(time.time() * 1000)}")
-                
+
                 # Send content_block_start event for tool use
                 content_block_start = {
                     "type": "content_block_start",
                     "index": block_index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": tool_id,
-                        "name": tool_name,
-                        "input": {}
-                    }
+                    "content_block": {"type": "tool_use", "id": tool_id, "name": tool_name, "input": {}},
                 }
                 yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
-                
+
                 # Stream tool input as JSON string chunks
                 input_json = json.dumps(tool_input)
                 chunk_size = 20  # characters per chunk for JSON
-                
+
                 for i in range(0, len(input_json), chunk_size):
-                    json_chunk = input_json[i:i + chunk_size]
-                    
+                    json_chunk = input_json[i : i + chunk_size]
+
                     content_block_delta = {
                         "type": "content_block_delta",
                         "index": block_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": json_chunk
-                        }
+                        "delta": {"type": "input_json_delta", "partial_json": json_chunk},
                     }
                     yield f"event: content_block_delta\ndata: {json.dumps(content_block_delta)}\n\n"
                     await asyncio.sleep(0.01)
-                
+
                 # Send content_block_stop event
-                content_block_stop = {
-                    "type": "content_block_stop",
-                    "index": block_index
-                }
+                content_block_stop = {"type": "content_block_stop", "index": block_index}
                 yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop)}\n\n"
-        
+
         # Send message_delta event with stop reason
         message_delta = {
             "type": "message_delta",
-            "delta": {
-                "stop_reason": original_response.get("stop_reason", "end_turn"),
-                "stop_sequence": None
-            },
-            "usage": {
-                "output_tokens": original_response.get("usage", {}).get("output_tokens", 0)
-            }
+            "delta": {"stop_reason": original_response.get("stop_reason", "end_turn"), "stop_sequence": None},
+            "usage": {"output_tokens": original_response.get("usage", {}).get("output_tokens", 0)},
         }
         yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
-        
+
         # Send message_stop event
         message_stop = {"type": "message_stop"}
         yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
-    
+
     async def openai_stream_generator(self, content: str, model: str):
         """Generate OpenAI SSE-formatted chunks from complete content
-        
+
         This is a dirty hack for OpenAI-style streaming from non-streaming response.
-        The sse format is subject to change based on OpenAI's implementation. 
+        The sse format is subject to change based on OpenAI's implementation.
         If so, try to use `MessageInspectionMiddleware` to inspect the update and fix accordingly.
         """
         raise NotImplementedError("OpenAI stream generator is not implemented yet.")
@@ -924,21 +885,28 @@ class LLMProxy:
         set_active_llm_proxy(self)
 
         # Install middleware if it's not already installed.
-        installed: bool = False
+        rollout_attempt_installed: bool = False
+        stream_conversion_installed: bool = False
         for mw in app.user_middleware:
             if mw.cls is RolloutAttemptMiddleware:
                 # Check whether the middleware is installed.
                 # It could be installed by other LLM Proxy instances, but it doesn't matter.
                 logger.info("Found existing RolloutAttemptMiddleware installed. Will not install a new one.")
-                installed = True
+                rollout_attempt_installed = True
+            if mw.cls is StreamConversionMiddleware:
+                logger.info("Found existing StreamConversionMiddleware installed. Will not install a new one.")
+                stream_conversion_installed = True
+            if rollout_attempt_installed and stream_conversion_installed:
                 break
 
-        if not installed:
+        if not rollout_attempt_installed:
             # Fallback to adding a new middleware
             logger.info("Adding a new middleware to the FastAPI app.")
             app.add_middleware(RolloutAttemptMiddleware)
 
-        app.add_middleware(StreamConversionMiddleware)
+        if not stream_conversion_installed:
+            logger.info("Adding a new middleware to the FastAPI app.")
+            app.add_middleware(StreamConversionMiddleware)
 
         if not initialize_llm_callbacks(self._add_return_token_ids):
             # If it's not the first time to initialize the callbacks, also
