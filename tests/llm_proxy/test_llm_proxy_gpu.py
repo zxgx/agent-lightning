@@ -513,8 +513,9 @@ async def test_anthropic_logprobs(qwen25_model: RemoteOpenAIServer):
 
                 # Check for token IDs and logprobs in the first choice
                 assert len(choices) > 0
-                assert "token_ids" in choices[0]
-                assert choices[0]["token_ids"]
+                if VLLM_VERSION >= (0, 10, 2):
+                    assert "token_ids" in choices[0]
+                    assert choices[0]["token_ids"]
                 assert "logprobs" in choices[0]
                 assert "content" in choices[0]["logprobs"]
                 assert len(choices[0]["logprobs"]["content"]) > 0

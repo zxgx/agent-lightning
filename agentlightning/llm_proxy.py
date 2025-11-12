@@ -977,7 +977,10 @@ class LLMProxy:
 
     !!! warning
 
-        The LLM Proxy does support streaming, but the tracing is still problematic when streaming is enabled.
+        By default (or when "stream_conversion" middleware is enabled), the LLM Proxy will convert OpenAI and Anthropic requests with `stream=True`
+        to a non-streaming request before going through the LiteLLM proxy. This is because the OpenTelemetry tracer provided by
+        LiteLLM is buggy with streaming responses. You can disable this by removing the "stream_conversion" middleware.
+        In that case, you might lose some tracing information like token IDs.
 
     !!! danger
 
@@ -1002,6 +1005,7 @@ class LLMProxy:
         middlewares: List of FastAPI middleware classes or strings to register. You can specify the class aliases or classes that have been imported.
             If not provided, the default middlewares (RolloutAttemptMiddleware and StreamConversionMiddleware) will be used.
             Available middleware aliases are: "rollout_attempt", "stream_conversion", "message_inspection".
+            Middlewares are the **first layer** of request processing. They are applied to all requests before the LiteLLM proxy.
         callbacks: List of LiteLLM callback classes or strings to register. You can specify the class aliases or classes that have been imported.
             If not provided, the default callbacks (AddReturnTokenIds and LightningOpenTelemetry) will be used.
             Available callback aliases are: "return_token_ids", "opentelemetry".
