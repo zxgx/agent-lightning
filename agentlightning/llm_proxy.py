@@ -592,8 +592,6 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         endpoint_format: Literal["openai", "anthropic"],
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        # Store original values
-        original_model = json_body.get("model", "unknown")
         # Convert to non-streaming request
         json_body["stream"] = False
         modified_body = json.dumps(json_body).encode()
@@ -627,20 +625,15 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
 
                 # Determine API format and extract content
                 if endpoint_format == "anthropic":
-                    # Anthropic format - handle multiple content blocks (text + tool_use)
-                    content_blocks = response_json.get("content", [])
-
                     return StreamingResponse(
-                        self.anthropic_stream_generator(content_blocks, response_json),
+                        self.anthropic_stream_generator(response_json),
                         media_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                     )
                 else:
                     # OpenAI format
-                    content = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-
                     return StreamingResponse(
-                        self.openai_stream_generator(content, original_model),
+                        self.openai_stream_generator(response_json),
                         media_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                     )
@@ -652,13 +645,15 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
             # Return the response as is because it's not a success
             return response
 
-    async def anthropic_stream_generator(self, content_blocks: List[Dict[str, Any]], original_response: Dict[str, Any]):
+    async def anthropic_stream_generator(self, original_response: Dict[str, Any]):
         """Generate Anthropic SSE-formatted chunks from complete content blocks
 
         This is a dirty hack for Anthropic-style streaming from non-streaming response.
         The sse format is subject to change based on Anthropic's implementation.
         If so, try to use `MessageInspectionMiddleware` to inspect the update and fix accordingly.
         """
+        # Anthropic format - handle multiple content blocks (text + tool_use)
+        content_blocks: List[Dict[str, Any]] = original_response.get("content", [])
         message_id = original_response.get("id", f"msg_{int(time.time() * 1000)}")
         model = original_response.get("model", "claude")
 
@@ -768,16 +763,157 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         message_stop = {"type": "message_stop"}
         yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
 
-    async def openai_stream_generator(self, content: str, model: str) -> AsyncGenerator[str, Any]:
-        """Generate OpenAI SSE-formatted chunks from complete content
-
-        This is a dirty hack for OpenAI-style streaming from non-streaming response.
-        The sse format is subject to change based on OpenAI's implementation.
-        If so, try to use `MessageInspectionMiddleware` to inspect the update and fix accordingly.
+    async def openai_stream_generator(self, response_json: Dict[str, Any]) -> AsyncGenerator[str, Any]:
         """
-        raise NotImplementedError("OpenAI stream generator is not implemented yet.")
-        # Just to make it a generator to make the type checker happy
-        yield f"data: {content}\n\n"  # type: ignore
+        Convert a *complete* OpenAI chat.completions choice into a stream of
+        OpenAI-compatible SSE chunks.
+
+        This emits:
+
+          - an initial delta with the role ("assistant"),
+          - a sequence of deltas for message.content (split into small chunks),
+          - deltas for any tool_calls (including id/name and chunked arguments),
+          - a terminal chunk with finish_reason,
+          - and finally the literal '[DONE]'.
+
+        Notes:
+
+        - We only handle a *single* choice (index 0 typically).
+        - We purposefully don't attempt to stream logprobs.
+        - Chunking strategy is simple and conservative to avoid splitting
+          multi-byte characters: we slice on spaces where possible, then fall
+          back to fixed-size substrings.
+        """
+        choice = cast(Dict[str, Any], (response_json.get("choices") or [{}])[0])
+        model = response_json.get("model", "unknown")
+        created: int = int(time.time())
+        index: int = choice.get("index", 0)
+
+        message: Dict[str, Any] = choice.get("message", {}) or {}
+        role: str = message.get("role", "assistant")
+        content: str = message.get("content") or ""
+        tool_calls: List[Any] = message.get("tool_calls") or []
+        finish_reason: Optional[str] = choice.get(
+            "finish_reason"
+        )  # e.g., "stop", "length", "tool_calls", "content_filter"
+
+        def sse_chunk(obj: Dict[str, Any]) -> str:
+            return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+        # 1) initial chunk with the role
+        yield sse_chunk(
+            {
+                "id": f"chatcmpl-{created}",
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": index, "delta": {"role": role}, "finish_reason": None}],
+            }
+        )
+
+        # 2) stream textual content as small deltas
+        async def stream_content(text: str):
+            if not text:
+                return
+            # prefer splitting on spaces in ~20–40 char pieces
+            approx = 28
+            start = 0
+            n = len(text)
+            while start < n:
+                end = min(start + approx, n)
+                if end < n:
+                    # try to break on a space going forward
+                    space = text.rfind(" ", start, end)
+                    if space > start:
+                        end = space + 1
+                delta_text = text[start:end]
+                start = end
+                if not delta_text:
+                    break
+                yield sse_chunk(
+                    {
+                        "id": f"chatcmpl-{created}",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": index, "delta": {"content": delta_text}, "finish_reason": None}],
+                    }
+                )
+                # tiny pause helps some UIs animate smoothly; keep very small
+                await asyncio.sleep(0.0)
+
+        async for piece in stream_content(content):  # type: ignore[misc]
+            yield piece  # pass through the produced chunks
+
+        # 3) stream tool_calls if present (id/name first, then arguments piecemeal)
+        for tc_index, tc in enumerate(tool_calls):
+            tc_type = tc.get("type", "function")
+            tc_id = tc.get("id") or f"call_{created}_{tc_index}"
+            fn: Dict[str, Any] = (tc.get("function") or {}) if tc_type == "function" else {}
+            fn_name: str = fn.get("name", "")
+            fn_args: str = fn.get("arguments", "") or ""
+
+            # (a) delta that announces the tool call id/type/name
+            yield sse_chunk(
+                {
+                    "id": f"chatcmpl-{created}",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": index,
+                            "delta": {
+                                "tool_calls": [
+                                    {"index": tc_index, "id": tc_id, "type": tc_type, "function": {"name": fn_name}}
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+
+            # (b) stream arguments in small substrings
+            arg_chunk_size = 40
+            for pos in range(0, len(fn_args), arg_chunk_size):
+                partial = fn_args[pos : pos + arg_chunk_size]
+                yield sse_chunk(
+                    {
+                        "id": f"chatcmpl-{created}",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": index,
+                                "delta": {"tool_calls": [{"index": tc_index, "function": {"arguments": partial}}]},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+                await asyncio.sleep(0.0)
+
+        # 4) terminal chunk with finish_reason (default to "stop" if missing)
+        yield sse_chunk(
+            {
+                "id": f"chatcmpl-{created}",
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": index,
+                        "delta": {},
+                        "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop"),
+                    }
+                ],
+            }
+        )
+
+        # 5) literal DONE sentinel
+        yield "data: [DONE]\n\n"
 
 
 _MIDDLEWARE_REGISTRY: Dict[str, Type[BaseHTTPMiddleware]] = {

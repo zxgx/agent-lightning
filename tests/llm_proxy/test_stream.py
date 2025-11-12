@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Iterator, List, Optional, cast
+from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional, cast
 
 import pytest
+
+from agentlightning.llm_proxy import StreamConversionMiddleware
 
 
 def merge_openai_streaming(chunks: Iterator[Dict[str, Any]]) -> Dict[str, Any]:
@@ -414,3 +416,299 @@ def test_openai_long_text_stream_rounds_up(text_len: int):
     )
     merged = merge_openai_streaming(chunks)
     assert merged["content"] == text
+
+
+async def collect_sse(gen: AsyncGenerator[str, Any]) -> List[str]:
+    """Drain an async generator of SSE strings into a list."""
+    out: List[str] = []
+    async for s in gen:
+        assert isinstance(s, str)
+        out.append(s)
+    return out
+
+
+def parse_openai_sse_to_json_events(sse_chunks: List[str]) -> List[Dict[str, Any]]:
+    """From the OpenAI stream (which uses only 'data:' lines), return JSON events.
+    Filters out the literal DONE sentinel.
+    """
+    events: List[Dict[str, Any]] = []
+    for chunk in sse_chunks:
+        # each chunk looks like 'data: {...}\n\n' OR 'data: [DONE]\n\n'
+        for line in chunk.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:") :].strip()
+            if payload == "[DONE]":
+                continue
+            events.append(json.loads(payload))
+    return events
+
+
+def parse_anthropic_sse_to_json_payloads(sse_chunks: List[str]) -> List[Dict[str, Any]]:
+    """Extract the JSON payload from each Anthropic SSE event (ignore pings)."""
+    out: List[Dict[str, Any]] = []
+    for chunk in sse_chunks:
+        # chunks look like 'event: <name>\ndata: {json}\n\n'
+        if "data:" not in chunk:
+            continue
+        data_line = [ln for ln in chunk.splitlines() if ln.startswith("data:")]
+        if not data_line:
+            continue
+        payload = data_line[0][len("data:") :].strip()
+        obj = json.loads(payload)
+        if obj.get("type") == "ping":
+            continue
+        out.append(obj)
+    return out
+
+
+@pytest.fixture
+def mw() -> StreamConversionMiddleware:
+    # BaseHTTPMiddleware requires an ASGI app; we only need the instance for bound methods.
+    class _DummyApp:
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            pass
+
+    return StreamConversionMiddleware(_DummyApp())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, finish_reason",
+    [
+        ("Hello world.", "stop"),
+        ("This answer was cut off on purpose.", "length"),
+    ],
+)
+async def test_openai_content_only_stream_roundtrip(mw: StreamConversionMiddleware, text: str, finish_reason: str):
+    response_json = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": finish_reason,
+                # include logprobs to ensure it doesn't interfere with streaming
+                "logprobs": None,
+            }
+        ],
+    }
+
+    sse_chunks = await collect_sse(mw.openai_stream_generator(response_json))
+
+    # basic shape checks
+    assert any('"delta": {"role": ' in s for s in sse_chunks)
+    assert any("[DONE]" in s for s in sse_chunks)
+
+    events = parse_openai_sse_to_json_events(sse_chunks)
+    assert events, "Expected JSON events from stream"
+
+    # the last JSON event before [DONE] should contain the finish_reason
+    last = events[-1]
+    assert last["choices"][0]["finish_reason"] == finish_reason
+
+    merged = merge_openai_streaming(iter(events))
+    assert merged["role"] == "assistant"
+    assert merged["content"] == text
+    assert "function_call" not in merged
+
+
+@pytest.mark.asyncio
+async def test_openai_long_text_chunking_and_reassembly(mw: StreamConversionMiddleware):
+    long_text = """
+        This is a deliberately long sentence that should be broken into multiple streaming deltas by the
+        chunking logic so that we can verify reassembly yields the exact same content without loss. """.strip()
+
+    response_json = {
+        "id": "chatcmpl-long",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": long_text}, "finish_reason": "stop"}],
+    }
+
+    sse_chunks = await collect_sse(mw.openai_stream_generator(response_json))
+    events = parse_openai_sse_to_json_events(sse_chunks)
+
+    # ensure multiple content delta chunks were emitted
+    content_deltas = [ev for ev in events if ev["choices"][0]["delta"].get("content")]
+    assert len(content_deltas) > 1
+
+    merged = merge_openai_streaming(iter(events))
+    assert merged["content"] == long_text
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_call_only_stream_roundtrip(mw: StreamConversionMiddleware):
+    response_json = {
+        "id": "chatcmpl-tool",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": json.dumps({"location": "Boston"}),
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+
+    sse_chunks = await collect_sse(mw.openai_stream_generator(response_json))
+    events = parse_openai_sse_to_json_events(sse_chunks)
+
+    # expect at least one tool_calls delta with name, followed by deltas with arguments
+    assert any(
+        (tc := ev["choices"][0]["delta"].get("tool_calls")) and tc[0].get("function", {}).get("name") == "get_weather"
+        for ev in events
+    )
+    assert any(
+        (tc := ev["choices"][0]["delta"].get("tool_calls")) and "arguments" in tc[0].get("function", {})
+        for ev in events
+    )
+
+    merged = merge_openai_streaming(iter(events))
+    assert merged["function_call"]["name"] == "get_weather"
+    assert merged["function_call"]["arguments"] == {"location": "Boston"}
+
+
+@pytest.mark.asyncio
+async def test_openai_content_and_tool_call_stream_roundtrip(mw: StreamConversionMiddleware):
+    response_json = {
+        "id": "chatcmpl-mixed",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "I'll call the weather tool now...",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": json.dumps({"location": "Singapore", "units": "metric"}),
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+
+    sse_chunks = await collect_sse(mw.openai_stream_generator(response_json))
+    events = parse_openai_sse_to_json_events(sse_chunks)
+
+    merged = merge_openai_streaming(iter(events))
+    assert merged["content"].startswith("I'll call the weather tool")
+    assert merged["function_call"]["name"] == "get_weather"
+    assert merged["function_call"]["arguments"] == {"location": "Singapore", "units": "metric"}
+
+
+@pytest.mark.asyncio
+async def test_anthropic_text_only_stream_roundtrip(mw: StreamConversionMiddleware):
+    original_response = {
+        "id": "msg_123",
+        "model": "claude-3.5-sonnet",
+        "content": [
+            {"type": "text", "text": "Hello there from Claude."},
+        ],
+        "usage": {"input_tokens": 0, "output_tokens": 7},
+        "stop_reason": "end_turn",
+    }
+
+    sse_chunks = await collect_sse(mw.anthropic_stream_generator(original_response))
+
+    # sanity: stream contains lifecycle events
+    assert any("event: message_start" in s for s in sse_chunks)
+    assert any("event: message_stop" in s for s in sse_chunks)
+
+    payloads = parse_anthropic_sse_to_json_payloads(sse_chunks)
+    merged = merge_anthropic_streaming(iter(payloads))
+
+    assert merged["role"] == "assistant"
+    assert merged["content_text"] == "Hello there from Claude."
+    assert "tool_calls" not in merged
+
+
+@pytest.mark.asyncio
+async def test_anthropic_tool_use_only_stream_roundtrip(mw: StreamConversionMiddleware):
+    original_response = {
+        "id": "msg_tool",
+        "model": "claude-3.5-sonnet",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "get_weather",
+                "input": {"location": "Boston"},
+            }
+        ],
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "stop_reason": "end_turn",
+    }
+
+    sse_chunks = await collect_sse(mw.anthropic_stream_generator(original_response))
+    payloads = parse_anthropic_sse_to_json_payloads(sse_chunks)
+
+    merged = merge_anthropic_streaming(iter(payloads))
+
+    assert merged["tool_calls"][0]["name"] == "get_weather"
+    assert merged["tool_calls"][0]["id"] == "toolu_1"
+    assert merged["tool_calls"][0]["input"] == {"location": "Boston"}
+
+
+@pytest.mark.asyncio
+async def test_anthropic_mixed_text_and_tool_use_roundtrip(mw: StreamConversionMiddleware):
+    # tool input is long to ensure multiple input_json_delta chunks
+    long_input = {
+        "location": "Singapore",
+        "units": "metric",
+        "details": {"hourly": True, "with_forecast": True, "days": 5},
+    }
+    original_response = {
+        "id": "msg_mixed",
+        "model": "claude-3.5-sonnet",
+        "content": [
+            {"type": "text", "text": "I'll check the weather tool for you."},
+            {"type": "tool_use", "id": "toolu_2", "name": "get_weather", "input": long_input},
+        ],
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "stop_reason": "end_turn",
+    }
+
+    sse_chunks = await collect_sse(mw.anthropic_stream_generator(original_response))
+    payloads = parse_anthropic_sse_to_json_payloads(sse_chunks)
+
+    # Verify we saw content_block_start/stop and deltas for both text and tool input
+    types = [p.get("type") for p in payloads]
+    assert "content_block_start" in types
+    assert "content_block_delta" in types
+    assert "content_block_stop" in types
+    assert any(p.get("delta", {}).get("type") == "text_delta" for p in payloads)
+    assert any(p.get("delta", {}).get("type") == "input_json_delta" for p in payloads)
+
+    merged = merge_anthropic_streaming(iter(payloads))
+    assert merged["content_text"].startswith("I'll check the weather tool")
+    tool = merged["tool_calls"][0]
+    assert tool["name"] == "get_weather"
+    assert tool["id"] == "toolu_2"
+    assert tool["input"] == long_input
