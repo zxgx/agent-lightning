@@ -43,6 +43,7 @@ from litellm.types.utils import CallTypes
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import Scope
 
 from agentlightning.types import LLM, ProxyLLM
 from agentlightning.utils.server_launcher import (
@@ -592,57 +593,77 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         endpoint_format: Literal["openai", "anthropic"],
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        # Convert to non-streaming request
-        json_body["stream"] = False
-        modified_body = json.dumps(json_body).encode()
+        # 1) Modify the request body to force stream=False
+        modified_json = dict(json_body)
+        modified_json["stream"] = False
+        modified_body = json.dumps(modified_json).encode("utf-8")
 
-        # Create new scope
-        scope = request.scope.copy()  # type: ignore
-        headers: List[Tuple[bytes, bytes]] = []
-        for k, v in request.scope["headers"]:
-            if k.lower() == b"accept":
-                if v.lower() != b"text/event-stream":
-                    logger.error(
-                        f"Accept header is expected to be text/event-stream for a streaming request but {v} found"
-                    )
-                headers.append((k, b"application/json"))
-            elif k.lower() == b"content-length":
-                headers.append((k, str(len(modified_body)).encode()))
+        # 2) Build a new scope + receive that yields our modified body
+        scope: Scope = dict(request.scope)
+        # rewrite headers for accept/content-length
+        new_headers: List[Tuple[bytes, bytes]] = []
+        saw_accept = False
+        for k, v in scope["headers"]:
+            kl = k.lower()
+            if kl == b"accept":
+                saw_accept = True
+                new_headers.append((k, b"application/json"))
+            elif kl == b"content-length":
+                # replace with new length
+                continue
             else:
-                headers.append((k, v))
+                new_headers.append((k, v))
+        if not saw_accept:
+            new_headers.append((b"accept", b"application/json"))
+        new_headers.append((b"content-length", str(len(modified_body)).encode("ascii")))
+        scope["headers"] = new_headers
 
-        # Store the modified request in the original request's state
+        # Directly modify the request body
+        # Creating a new request won't work because request is cached in the base class
         request._body = modified_body  # type: ignore
-        request.scope["headers"] = headers
 
-        # Call the next handler with modified request
         response = await call_next(request)
 
-        # If response is successful, convert to streaming
-        if response.status_code >= 200 and response.status_code < 300:
+        buffered: Optional[bytes] = None
+        # 4) If OK, buffer the response body (it should be JSON because we forced stream=False)
+        if 200 <= response.status_code < 300:
             try:
-                response_json = json.loads(response.body)  # type: ignore
+                if hasattr(response, "body_iterator"):
+                    # Buffer body safely
+                    body_chunks: List[bytes] = []
+                    async for chunk in response.body_iterator:  # type: ignore
+                        body_chunks.append(chunk)  # type: ignore
+                    buffered = b"".join(body_chunks)
+                else:
+                    buffered = response.body  # type: ignore
 
-                # Determine API format and extract content
+                data = json.loads(buffered or b"{}")
+
                 if endpoint_format == "anthropic":
                     return StreamingResponse(
-                        self.anthropic_stream_generator(response_json),
+                        self.anthropic_stream_generator(data),
                         media_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                     )
                 else:
-                    # OpenAI format
+                    # openai format
                     return StreamingResponse(
-                        self.openai_stream_generator(response_json),
+                        self.openai_stream_generator(data),
                         media_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                     )
-
             except Exception as e:
-                logger.exception(f"Error converting to stream, falling back to return a non-streaming response: {e}")
-                return response
+                # If anything goes wrong, fall back to non-streaming JSON
+                logger.exception(f"Error converting to stream; returning non-stream response: {e}")
+                # Rebuild the consumed response
+                return Response(
+                    content=buffered if buffered is not None else b"",
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    media_type=response.media_type,
+                    background=response.background,
+                )
         else:
-            # Return the response as is because it's not a success
             return response
 
     async def anthropic_stream_generator(self, original_response: Dict[str, Any]):
@@ -798,6 +819,7 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         )  # e.g., "stop", "length", "tool_calls", "content_filter"
 
         def sse_chunk(obj: Dict[str, Any]) -> str:
+            print("sse_chunk: ", obj)
             return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
         # 1) initial chunk with the role

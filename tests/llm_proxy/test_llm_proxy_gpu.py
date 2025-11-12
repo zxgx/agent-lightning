@@ -368,7 +368,6 @@ async def test_tool_call_roundtrip(qwen25_model: RemoteOpenAIServer):
         await store.stop()
 
 
-@pytest.mark.skip(reason="Streaming is not supported yet")
 @pytest.mark.asyncio
 async def test_streaming_chunks(qwen25_model: RemoteOpenAIServer):
     proxy, store = await _make_proxy_and_store(qwen25_model)
@@ -383,6 +382,7 @@ async def test_streaming_chunks(qwen25_model: RemoteOpenAIServer):
         )
         collected: list[str] = []
         for evt in stream:
+            print(f">>> Event: {evt}")
             for c in evt.choices:
                 if c.delta and getattr(c.delta, "content", None):
                     assert isinstance(c.delta.content, str)
@@ -391,7 +391,13 @@ async def test_streaming_chunks(qwen25_model: RemoteOpenAIServer):
 
         spans = await store.query_spans(rollout.rollout_id, rollout.attempt.attempt_id)
         assert len(spans) > 0
-        # TODO: didn't test the token ids in streaming chunks here
+        for span in spans:
+            print(f">>> Span {span.name}: {span.attributes}")
+            if span.name == "raw_gen_ai_request":
+                assert "llm.hosted_vllm.prompt_token_ids" in span.attributes
+                assert "llm.hosted_vllm.choices" in span.attributes
+            if span.name == "litellm_request":
+                assert "gen_ai.completion.0.content" in span.attributes
     finally:
         await proxy.stop()
         await store.stop()
@@ -424,6 +430,8 @@ async def test_anthropic_token_ids(qwen25_model: RemoteOpenAIServer):
         for i, triplet in enumerate(triplets):
             print(f">>> Triplet {i}: {triplet}")
         assert len(triplets) == 1
+        assert triplets[0].prompt["token_ids"]
+        assert triplets[0].response["token_ids"]
 
         # stream
         response = client.messages.create(
@@ -437,10 +445,17 @@ async def test_anthropic_token_ids(qwen25_model: RemoteOpenAIServer):
         spans = await store.query_spans(rollout.rollout_id, rollout.attempt.attempt_id)
         for i, span in enumerate(spans):
             print(f">>> Span {i}: {span.name}, attributes: {span.attributes}")
+            if span.name == "raw_gen_ai_request":
+                assert "llm.hosted_vllm.prompt_token_ids" in span.attributes
+                assert "llm.hosted_vllm.choices" in span.attributes
+            if span.name == "litellm_request":
+                assert "gen_ai.completion.0.content" in span.attributes
         assert len(spans) > 0
         triplets = adapter.adapt(spans)
         for i, triplet in enumerate(triplets):
             print(f">>> Triplet {i}: {triplet}")
+            assert triplet.prompt["token_ids"]
+            assert triplet.response["token_ids"]
         assert len(triplets) == 2
     finally:
         await proxy.stop()
