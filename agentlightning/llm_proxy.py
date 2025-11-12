@@ -21,8 +21,11 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Literal,
     Optional,
     Sequence,
+    Tuple,
+    Type,
     TypedDict,
     Union,
     cast,
@@ -36,6 +39,7 @@ from fastapi.responses import StreamingResponse
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.opentelemetry import OpenTelemetry, OpenTelemetryConfig
 from litellm.proxy.proxy_server import app, save_worker_config  # pyright: ignore[reportUnknownVariableType]
+from litellm.types.utils import CallTypes
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -519,93 +523,110 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
         return response
 
 
-class MessageInspectionMiddleware:
+class MessageInspectionMiddleware(BaseHTTPMiddleware):
+    """Middleware to inspect the request and response bodies.
 
-    def __init__(self, app):
-        self.app = app
+    It's for debugging purposes. Add it via "message_inspection" middleware alias.
+    """
 
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        print(f">>> DEBUG: Received request with scope\n{scope}\n")
-
-        async def log_request():
-            message = await receive()
-            print(f">>> DEBUG: Received message ({type(message)})\n{message}\n")
-            return message
-
-        async def log_response(message):
-            print(f">>> DEBUG: Sending message ({type(message)})\n{message}\n")
-            await send(message)
-
-        await self.app(scope, log_request, log_response)
+    async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        ti = time.time()
+        logger.info(f"Received request with scope: {request.scope}")
+        logger.info(f"Received request with body: {await request.body()}")
+        response = await call_next(request)
+        elapsed = time.time() - ti
+        logger.info(f"Response to request took {elapsed} seconds")
+        logger.info(f"Received response with status code: {response.status_code}")
+        logger.info(f"Received response with body: {response.body}")
+        return response
 
 
 class StreamConversionMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
+    """Middleware to convert streaming responses to non-streaming responses.
+
+    Useful for backend that only supports non-streaming responses.
+
+    LiteLLM's OpenTelemetry is also buggy with streaming responses.
+    The conversion will hopefully bypass the bug.
+    """
+
+    async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         # Only process POST requests to completion endpoints
         if request.method != "POST":
             return await call_next(request)
 
         # Check if it's a chat completions or messages endpoint
-        is_openai = "chat/completions" in request.url.path
-        is_anthropic = "/messages" in request.url.path
+        endpoint_format: Literal["openai", "anthropic", "unknown"] = "unknown"
+        if request.url.path.endswith("/chat/completions") or "/chat/completions?" in request.url.path:
+            endpoint_format = "openai"
+        elif request.url.path.endswith("/messages") or "/messages?" in request.url.path:
+            endpoint_format = "anthropic"
+        else:
+            endpoint_format = "unknown"
 
-        if not (is_openai or is_anthropic):
+        if endpoint_format == "unknown":
+            # Directly bypass the middleware
             return await call_next(request)
 
         # Read the request body
         try:
             json_body = await request.json()
         except json.JSONDecodeError:
+            logger.warning(f"Request body is not valid JSON: {request.body}")
             return await call_next(request)
 
         # Check if streaming is requested
         is_streaming = json_body.get("stream", False)
 
+        # Simple case: no streaming requested, just return the response
         if not is_streaming:
             return await call_next(request)
 
+        # Now the stream case
+        return await self._handle_stream_case(request, json_body, endpoint_format, call_next)
+
+    async def _handle_stream_case(
+        self,
+        request: Request,
+        json_body: Dict[str, Any],
+        endpoint_format: Literal["openai", "anthropic"],
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
         # Store original values
         original_model = json_body.get("model", "unknown")
-
         # Convert to non-streaming request
         json_body["stream"] = False
         modified_body = json.dumps(json_body).encode()
 
-        # Create a new scope with modified body
-        async def receive():
-            return {"type": "http.request", "body": modified_body, "more_body": False}
-
         # Create new scope
-        scope = request.scope.copy()
-        scope["headers"] = [(k, v) for k, v in request.scope["headers"] if k.lower() != b"content-length"]
-        # Add correct content-length
-        scope["headers"].append((b"content-length", str(len(modified_body)).encode()))
-
-        # Create a modified request
-        modified_request = Request(scope, receive=receive)
+        scope = request.scope.copy()  # type: ignore
+        headers: List[Tuple[bytes, bytes]] = []
+        for k, v in request.scope["headers"]:
+            if k.lower() == b"accept":
+                if v.lower() != b"text/event-stream":
+                    logger.error(
+                        f"Accept header is expected to be text/event-stream for a streaming request but {v} found"
+                    )
+                headers.append((k, b"application/json"))
+            elif k.lower() == b"content-length":
+                headers.append((k, str(len(modified_body)).encode()))
+            else:
+                headers.append((k, v))
 
         # Store the modified request in the original request's state
-        request._body = modified_body
+        request._body = modified_body  # type: ignore
+        request.scope["headers"] = headers
 
         # Call the next handler with modified request
-        response = await call_next(modified_request)
+        response = await call_next(request)
 
         # If response is successful, convert to streaming
-        if response.status_code == 200:
-            # Read the response body
-            response_body = b""
-            async for chunk in response.body_iterator:
-                response_body += chunk
-
+        if response.status_code >= 200 and response.status_code < 300:
             try:
-                response_json = json.loads(response_body)
+                response_json = json.loads(response.body)  # type: ignore
 
                 # Determine API format and extract content
-                if is_anthropic:
+                if endpoint_format == "anthropic":
                     # Anthropic format - handle multiple content blocks (text + tool_use)
                     content_blocks = response_json.get("content", [])
 
@@ -625,15 +646,13 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
                     )
 
             except Exception as e:
-                print(f"Error converting to stream: {e}")
-                import traceback
+                logger.exception(f"Error converting to stream, falling back to return a non-streaming response: {e}")
+                return response
+        else:
+            # Return the response as is because it's not a success
+            return response
 
-                traceback.print_exc()
-                return Response(content=response_body, status_code=response.status_code, headers=dict(response.headers))
-
-        return response
-
-    async def anthropic_stream_generator(self, content_blocks: list, original_response: dict):
+    async def anthropic_stream_generator(self, content_blocks: List[Dict[str, Any]], original_response: Dict[str, Any]):
         """Generate Anthropic SSE-formatted chunks from complete content blocks
 
         This is a dirty hack for Anthropic-style streaming from non-streaming response.
@@ -644,7 +663,7 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         model = original_response.get("model", "claude")
 
         # Send message_start event
-        message_start = {
+        message_start: Dict[str, Any] = {
             "type": "message_start",
             "message": {
                 "id": message_id,
@@ -711,7 +730,7 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
                 tool_id = block.get("id", f"toolu_{int(time.time() * 1000)}")
 
                 # Send content_block_start event for tool use
-                content_block_start = {
+                content_block_start: Dict[str, Any] = {
                     "type": "content_block_start",
                     "index": block_index,
                     "content_block": {"type": "tool_use", "id": tool_id, "name": tool_name, "input": {}},
@@ -749,7 +768,7 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         message_stop = {"type": "message_stop"}
         yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
 
-    async def openai_stream_generator(self, content: str, model: str):
+    async def openai_stream_generator(self, content: str, model: str) -> AsyncGenerator[str, Any]:
         """Generate OpenAI SSE-formatted chunks from complete content
 
         This is a dirty hack for OpenAI-style streaming from non-streaming response.
@@ -757,6 +776,21 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         If so, try to use `MessageInspectionMiddleware` to inspect the update and fix accordingly.
         """
         raise NotImplementedError("OpenAI stream generator is not implemented yet.")
+        # Just to make it a generator to make the type checker happy
+        yield f"data: {content}\n\n"  # type: ignore
+
+
+_MIDDLEWARE_REGISTRY: Dict[str, Type[BaseHTTPMiddleware]] = {
+    "rollout_attempt": RolloutAttemptMiddleware,
+    "stream_conversion": StreamConversionMiddleware,
+    "message_inspection": MessageInspectionMiddleware,
+}
+
+
+_CALLBACK_REGISTRY = {
+    "return_token_ids": AddReturnTokenIds,
+    "opentelemetry": LightningOpenTelemetry,
+}
 
 
 class LLMProxy:
@@ -804,6 +838,12 @@ class LLMProxy:
             `launch_mode="asyncio"` launches the server in the current thread as an asyncio task.
             It is NOT recommended because it often causes hanging requests. Only use it if you know what you are doing.
         launcher_args: Arguments for the server launcher. If this is provided, host, port, and launch_mode will be ignored. Cannot be used together with port, host, and launch_mode.
+        middlewares: List of FastAPI middleware classes or strings to register. You can specify the class aliases or classes that have been imported.
+            If not provided, the default middlewares (RolloutAttemptMiddleware and StreamConversionMiddleware) will be used.
+            Available middleware aliases are: "rollout_attempt", "stream_conversion", "message_inspection".
+        callbacks: List of LiteLLM callback classes or strings to register. You can specify the class aliases or classes that have been imported.
+            If not provided, the default callbacks (AddReturnTokenIds and LightningOpenTelemetry) will be used.
+            Available callback aliases are: "return_token_ids", "opentelemetry".
     """
 
     def __init__(
@@ -817,7 +857,8 @@ class LLMProxy:
         num_workers: int = 1,
         launch_mode: LaunchMode = "mp",
         launcher_args: PythonServerLauncherArgs | None = None,
-        _add_return_token_ids: bool = True,
+        middlewares: List[Union[Type[BaseHTTPMiddleware], str]] | None = None,
+        callbacks: List[Union[Type[CustomLogger], str]] | None = None,
     ):
         self.store = store
 
@@ -849,7 +890,33 @@ class LLMProxy:
 
         self._config_file = None
 
-        self._add_return_token_ids = _add_return_token_ids
+        self.middlewares: List[Type[BaseHTTPMiddleware]] = []
+        if middlewares is None:
+            middlewares = ["rollout_attempt", "stream_conversion"]
+        for middleware in middlewares:
+            if isinstance(middleware, str):
+                if middleware not in _MIDDLEWARE_REGISTRY:
+                    raise ValueError(
+                        f"Invalid middleware alias: {middleware}. Available aliases are: {list(_MIDDLEWARE_REGISTRY.keys())}"
+                    )
+                middleware = _MIDDLEWARE_REGISTRY[middleware]
+                self.middlewares.append(middleware)
+            else:
+                self.middlewares.append(middleware)
+
+        self.callbacks: List[Type[CustomLogger]] = []
+        if callbacks is None:
+            callbacks = ["return_token_ids", "opentelemetry"]
+        for callback in callbacks:
+            if isinstance(callback, str):
+                if callback not in _CALLBACK_REGISTRY:
+                    raise ValueError(
+                        f"Invalid callback alias: {callback}. Available aliases are: {list(_CALLBACK_REGISTRY.keys())}"
+                    )
+                callback = _CALLBACK_REGISTRY[callback]
+                self.callbacks.append(callback)
+            else:
+                self.callbacks.append(callback)
 
     def get_store(self) -> Optional[LightningStore]:
         """Get the store used by the proxy.
@@ -901,30 +968,18 @@ class LLMProxy:
         set_active_llm_proxy(self)
 
         # Install middleware if it's not already installed.
-        rollout_attempt_installed: bool = False
-        stream_conversion_installed: bool = False
+        installation_status: Dict[Any, bool] = {}
         for mw in app.user_middleware:
-            if mw.cls is RolloutAttemptMiddleware:
-                # Check whether the middleware is installed.
-                # It could be installed by other LLM Proxy instances, but it doesn't matter.
-                logger.info("Found existing RolloutAttemptMiddleware installed. Will not install a new one.")
-                rollout_attempt_installed = True
-            if mw.cls is StreamConversionMiddleware:
-                logger.info("Found existing StreamConversionMiddleware installed. Will not install a new one.")
-                stream_conversion_installed = True
-            if rollout_attempt_installed and stream_conversion_installed:
-                break
+            installation_status[mw.cls] = True
 
-        if not rollout_attempt_installed:
-            # Fallback to adding a new middleware
-            logger.info("Adding a new middleware to the FastAPI app.")
-            app.add_middleware(RolloutAttemptMiddleware)
+        for mw in self.middlewares:
+            if mw not in installation_status:
+                logger.info(f"Adding middleware {mw} to the FastAPI app.")
+                app.add_middleware(mw)
+            else:
+                logger.info(f"Middleware {mw} is already installed. Will not install a new one.")
 
-        if not stream_conversion_installed:
-            logger.info("Adding a new middleware to the FastAPI app.")
-            app.add_middleware(StreamConversionMiddleware)
-
-        if not initialize_llm_callbacks(self._add_return_token_ids):
+        if not initialize_llm_callbacks(self.callbacks):
             # If it's not the first time to initialize the callbacks, also
             # reset LiteLLM's logging worker so its asyncio.Queue binds to the new loop.
             _reset_litellm_logging_worker()
@@ -1118,7 +1173,7 @@ def set_active_llm_proxy(proxy: LLMProxy) -> None:
     _global_llm_proxy = proxy
 
 
-def initialize_llm_callbacks(_add_return_token_ids: bool = True) -> bool:
+def initialize_llm_callbacks(callback_classes: List[Type[CustomLogger]]) -> bool:
     """Restore `litellm.callbacks` to a state that is just initialized by agent-lightning.
 
     When litellm is restarted multiple times in the same process, more and more callbacks
@@ -1126,8 +1181,7 @@ def initialize_llm_callbacks(_add_return_token_ids: bool = True) -> bool:
     This function remembers the initial state of `litellm.callbacks` and always restore to that state.
 
     Args:
-        _add_return_token_ids: Whether to add the return token ids callback. Internal use only.
-        Ideally the callback should automatically be enabled when the backend supports it.
+        callback_classes: List of callback classes to register.
 
     Returns:
         Whether the callbacks are initialized for the first time.
@@ -1135,31 +1189,24 @@ def initialize_llm_callbacks(_add_return_token_ids: bool = True) -> bool:
     global _callbacks_before_litellm_start
 
     if _callbacks_before_litellm_start is None:
-        litellm.callbacks.extend(  # type: ignore
-            [
-                AddReturnTokenIds(),
-                LightningOpenTelemetry(),
-            ]
-            if _add_return_token_ids
-            else [
-                LightningOpenTelemetry(),
-            ]
-        )
+        litellm.callbacks.extend([cls() for cls in callback_classes])  # type: ignore
         _callbacks_before_litellm_start = [*litellm.callbacks]  # type: ignore
         return True
 
     _reset_litellm_logging_callback_manager()
 
-    # Check if tracer provider is malformed due to global tracer clear in tests.
-    if not _check_tracer_provider():
-        logger.warning(
-            "Global tracer provider might have been cleared outside. Re-initializing OpenTelemetry callback."
-        )
-        _callbacks_before_litellm_start = [
-            cb for cb in _callbacks_before_litellm_start if not isinstance(cb, LightningOpenTelemetry)
-        ] + [LightningOpenTelemetry()]
-    else:
-        logger.debug("Global tracer provider is valid. Reusing existing OpenTelemetry callback.")
+    if LightningOpenTelemetry in callback_classes:
+        # Check if tracer provider is malformed due to global tracer clear in tests.
+        if not _check_tracer_provider():
+            logger.warning(
+                "Global tracer provider might have been cleared outside. Re-initializing OpenTelemetry callback."
+            )
+            _callbacks_before_litellm_start = [
+                cb for cb in _callbacks_before_litellm_start if not isinstance(cb, LightningOpenTelemetry)
+            ] + [LightningOpenTelemetry()]
+        else:
+            logger.debug("Global tracer provider is valid. Reusing existing OpenTelemetry callback.")
+    # Otherwise, we just skip the check for opentelemetry and use the existing callback.
 
     litellm.callbacks.clear()  # type: ignore
     litellm.callbacks.extend(_callbacks_before_litellm_start)  # type: ignore
