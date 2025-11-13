@@ -9,14 +9,19 @@ import threading
 import time
 import traceback
 from contextlib import suppress
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Sequence, Union
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, Generic, List, Literal, Optional, Sequence, TypeVar, Union
 
 import aiohttp
 import uvicorn
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException
+from fastapi import Query as FastAPIQuery
+from fastapi import Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from opentelemetry.sdk.trace import ReadableSpan
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 
 from agentlightning.types import (
     Attempt,
@@ -29,15 +34,26 @@ from agentlightning.types import (
     RolloutStatus,
     Span,
     TaskInput,
+    Worker,
+    WorkerStatus,
 )
 
-from .base import UNSET, LightningStore, Unset
+from .base import UNSET, LightningStore, LightningStoreCapabilities, Unset
 
 logger = logging.getLogger(__name__)
 
+API_V1_PREFIX = "/v1"
+API_AGL_PREFIX = "/agl"
+API_V1_AGL_PREFIX = API_V1_PREFIX + API_AGL_PREFIX
 
-class PydanticUnset(BaseModel):
-    _type: Literal["UNSET"] = "UNSET"
+T = TypeVar("T")
+
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    items: List[T]
+    limit: int
+    offset: int
+    total: int
 
 
 class RolloutRequest(BaseModel):
@@ -48,9 +64,22 @@ class RolloutRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class DequeueRolloutRequest(BaseModel):
+    worker_id: Optional[str] = None
+
+
 class QueryRolloutsRequest(BaseModel):
-    status: Optional[List[RolloutStatus]] = None
-    rollout_ids: Optional[List[str]] = None
+    status_in: Optional[List[RolloutStatus]] = Field(FastAPIQuery(default=None))
+    rollout_id_in: Optional[List[str]] = Field(FastAPIQuery(default=None))
+    rollout_id_contains: Optional[str] = None
+    # Pagination
+    limit: int = -1
+    offset: int = 0
+    # Sorting
+    sort_by: Optional[str] = None
+    sort_order: Literal["asc", "desc"] = "asc"
+    # Filtering logic
+    filter_logic: Literal["and", "or"] = "and"
 
 
 class WaitForRolloutsRequest(BaseModel):
@@ -58,31 +87,188 @@ class WaitForRolloutsRequest(BaseModel):
     timeout: Optional[float] = None
 
 
-class RolloutId(BaseModel):
+class NextSequenceIdRequest(BaseModel):
     rollout_id: str
+    attempt_id: str
 
 
-class AddResourcesRequest(BaseModel):
-    resources: NamedResources
+class NextSequenceIdResponse(BaseModel):
+    sequence_id: int
 
 
 class UpdateRolloutRequest(BaseModel):
-    rollout_id: str
-    input: Union[TaskInput, PydanticUnset] = Field(default_factory=PydanticUnset)
-    mode: Union[Optional[Literal["train", "val", "test"]], PydanticUnset] = Field(default_factory=PydanticUnset)
-    resources_id: Union[Optional[str], PydanticUnset] = Field(default_factory=PydanticUnset)
-    status: Union[RolloutStatus, PydanticUnset] = Field(default_factory=PydanticUnset)
-    config: Union[RolloutConfig, PydanticUnset] = Field(default_factory=PydanticUnset)
-    metadata: Union[Dict[str, Any], PydanticUnset] = Field(default_factory=PydanticUnset)
+    input: Optional[TaskInput] = None
+    mode: Optional[Literal["train", "val", "test"]] = None
+    resources_id: Optional[str] = None
+    status: Optional[RolloutStatus] = None
+    config: Optional[RolloutConfig] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class UpdateAttemptRequest(BaseModel):
+    status: Optional[AttemptStatus] = None
+    worker_id: Optional[str] = None
+    last_heartbeat_time: Optional[float] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class UpdateWorkerRequest(BaseModel):
+    heartbeat_stats: Optional[Dict[str, Any]] = None
+
+
+class QueryAttemptsRequest(BaseModel):
+    # Pagination
+    limit: int = -1
+    offset: int = 0
+    # Sorting
+    sort_by: Optional[str] = None
+    sort_order: Literal["asc", "desc"] = "asc"
+
+
+class QueryResourcesRequest(BaseModel):
+    # Filtering
+    resources_id: Optional[str] = None
+    resources_id_contains: Optional[str] = None
+    # Pagination
+    limit: int = -1
+    offset: int = 0
+    # Sorting
+    sort_by: Optional[str] = None
+    sort_order: Literal["asc", "desc"] = "asc"
+
+
+class QuerySpansRequest(BaseModel):
     rollout_id: str
-    attempt_id: Union[str, Literal["latest"]]
-    status: Union[AttemptStatus, PydanticUnset] = Field(default_factory=PydanticUnset)
-    worker_id: Union[str, PydanticUnset] = Field(default_factory=PydanticUnset)
-    last_heartbeat_time: Union[float, PydanticUnset] = Field(default_factory=PydanticUnset)
-    metadata: Union[Dict[str, Any], PydanticUnset] = Field(default_factory=PydanticUnset)
+    attempt_id: Optional[str] = None
+    # Filtering
+    trace_id: Optional[str] = None
+    trace_id_contains: Optional[str] = None
+    span_id: Optional[str] = None
+    span_id_contains: Optional[str] = None
+    parent_id: Optional[str] = None
+    parent_id_contains: Optional[str] = None
+    name: Optional[str] = None
+    name_contains: Optional[str] = None
+    filter_logic: Literal["and", "or"] = "and"
+    # Pagination
+    limit: int = -1
+    offset: int = 0
+    # Sorting
+    sort_by: Optional[str] = None
+    sort_order: Literal["asc", "desc"] = "asc"
+
+
+class QueryWorkersRequest(BaseModel):
+    status_in: Optional[List[WorkerStatus]] = Field(FastAPIQuery(default=None))
+    worker_id_contains: Optional[str] = None
+    # Pagination
+    limit: int = -1
+    offset: int = 0
+    # Sorting
+    sort_by: Optional[str] = None
+    sort_order: Literal["asc", "desc"] = "asc"
+    # Filtering logic
+    filter_logic: Literal["and", "or"] = "and"
+
+
+def _apply_filters_sort_paginate(
+    items: List[T],
+    filters: Dict[str, Any],
+    filter_logic: Literal["and", "or"],
+    sort_by: Optional[str],
+    sort_order: Literal["asc", "desc"],
+    limit: int,
+    offset: int,
+) -> PaginatedResponse[T]:
+    """Apply filtering, sorting, and pagination to a list of items."""
+    # Apply filters
+    filtered_items: List[T] = []
+    if not filters:
+        filtered_items = items
+    else:
+        for item in items:
+            matches: List[bool] = []
+            for key, value in filters.items():
+                if value is None:
+                    continue
+
+                # Handle _in suffix (list membership)
+                if key.endswith("_in"):
+                    field = key[:-3]
+                    item_value = getattr(item, field, None)
+                    matches.append(item_value in value if isinstance(value, list) else False)
+                # Handle _contains suffix (substring match)
+                elif key.endswith("_contains"):
+                    field = key[:-9]
+                    item_value = getattr(item, field, None)
+                    if item_value is not None and isinstance(item_value, str) and isinstance(value, str):
+                        matches.append(value in item_value)
+                    else:
+                        matches.append(False)
+                # Exact match
+                else:
+                    item_value = getattr(item, key, None)
+                    matches.append(item_value == value)
+
+            if matches:
+                if filter_logic == "and":
+                    if all(matches):
+                        filtered_items.append(item)
+                else:  # "or"
+                    if any(matches):
+                        filtered_items.append(item)
+
+    # Apply sorting
+
+    def _get_sort_value(item: T, sort_by: str) -> Any:
+        if sort_by.endswith("_time"):
+            value = getattr(item, sort_by, None)
+            if value is None:
+                value = float("inf")
+            return value
+        else:
+            # Other than _time, we assume the value must be a string
+            value = getattr(item, sort_by, None)
+            if value is None:
+                if sort_by not in item.__class__.model_fields:  # type: ignore
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Failed to sort items by {sort_by}: {sort_by} is not a field of {item.__class__.__name__}",
+                    )
+                field_type = str(item.__class__.model_fields[sort_by].annotation)  # type: ignore
+                if "str" in field_type or "Literal" in field_type:
+                    return ""
+                if "int" in field_type:
+                    return 0
+                if "float" in field_type:
+                    return 0.0
+                raise HTTPException(
+                    status_code=400, detail=f"Failed to sort items by {sort_by}: {value} is not a string or number"
+                )
+            return value
+
+    if sort_by:
+        reverse = sort_order == "desc"
+        filtered_items.sort(key=lambda x: _get_sort_value(x, sort_by), reverse=reverse)
+
+    # Get total count before pagination
+    total = len(filtered_items)
+
+    # Apply pagination
+    if limit == -1:
+        paginated_items = filtered_items[offset:]
+    else:
+        paginated_items = filtered_items[offset : offset + limit]
+
+    return PaginatedResponse(items=paginated_items, limit=limit, offset=offset, total=total)
+
+
+class CachedStaticFiles(StaticFiles):
+    def file_response(self, *args: Any, **kwargs: Any) -> Response:
+        resp = super().file_response(*args, **kwargs)
+        # hashed filenames are safe to cache "forever"
+        resp.headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
+        return resp
 
 
 class LightningStoreServer(LightningStore):
@@ -93,15 +279,29 @@ class LightningStoreServer(LightningStore):
     Healthcheck and watchdog relies on the underlying store.
 
     `agl store` is a convenient CLI to start a store server.
+
+    Args:
+        store: The underlying store to delegate operations to.
+        host: The hostname or IP address to bind the server to.
+        port: The TCP port to listen on.
+        cors_allow_origins: A list of CORS origins to allow. Use '*' to allow all origins.
     """
 
-    def __init__(self, store: LightningStore, host: str, port: int):
+    def __init__(
+        self,
+        store: LightningStore,
+        host: str,
+        port: int,
+        cors_allow_origins: Sequence[str] | str | None = None,
+    ):
         super().__init__()
         self.store = store
         self._lock = threading.Lock()
         self.host = host
         self.port = port
+        self._cors_allow_origins = self._normalize_cors_origins(cors_allow_origins)
         self.app: FastAPI | None = FastAPI(title="LightningStore Server")
+        self._apply_cors()
         self._setup_routes()
         self._uvicorn_config: uvicorn.Config | None = uvicorn.Config(
             self.app, host="0.0.0.0", port=self.port, log_level="error"
@@ -109,6 +309,7 @@ class LightningStoreServer(LightningStore):
         self._uvicorn_server: uvicorn.Server | None = uvicorn.Server(self._uvicorn_config)
 
         self._serving_thread: Optional[threading.Thread] = None
+        self._server_start_exception: Optional[BaseException] = None
 
         # Process-awareness:
         # LightningStoreServer holds a plain Python object (self.store) in one process
@@ -119,6 +320,14 @@ class LightningStoreServer(LightningStore):
         # and only mutate the store in that process.
         self._owner_pid = os.getpid()
         self._client: Optional[LightningStoreClient] = None
+
+    def capabilities(self) -> LightningStoreCapabilities:
+        """Return the capabilities of the store."""
+        capabilities = self.store.capabilities().copy()
+        capabilities["async_safe"] = True
+        capabilities["thread_safe"] = True
+        capabilities["zero_copy"] = True
+        return capabilities
 
     def __getstate__(self):
         """
@@ -135,6 +344,7 @@ class LightningStoreServer(LightningStore):
             "host": self.host,
             "port": self.port,
             "_owner_pid": self._owner_pid,
+            "_cors_allow_origins": self._cors_allow_origins,
         }
 
     def __setstate__(self, state: Dict[str, Any]):
@@ -149,10 +359,47 @@ class LightningStoreServer(LightningStore):
         self.host = state["host"]
         self.port = state["port"]
         self._owner_pid = state["_owner_pid"]
+        self._cors_allow_origins = state.get("_cors_allow_origins")
         self._client = None
         self._lock = threading.Lock()
         # Do NOT reconstruct app, _uvicorn_config, _uvicorn_server
         # to avoid transferring server state to subprocess
+
+    @staticmethod
+    def _normalize_cors_origins(
+        origins: Sequence[str] | str | None,
+    ) -> list[str] | None:
+        if origins is None:
+            return None
+
+        if isinstance(origins, str):
+            candidates = [origins]
+        else:
+            candidates = list(origins)
+
+        cleaned: list[str] = []
+        for origin in candidates:
+            if not origin or not origin.strip():
+                continue
+            value = origin.strip()
+            if value == "*":
+                return ["*"]
+            cleaned.append(value)
+
+        return cleaned or None
+
+    def _apply_cors(self) -> None:
+        if self.app is None or not self._cors_allow_origins:
+            return
+
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=self._cors_allow_origins.copy(),
+            allow_methods=["*"],
+            allow_headers=["*"],
+            allow_credentials=True,
+            expose_headers=["*"],
+        )
 
     @property
     def endpoint(self) -> str:
@@ -167,16 +414,44 @@ class LightningStoreServer(LightningStore):
         logger.info(f"Starting server at {self.endpoint}")
 
         uvicorn_server = self._uvicorn_server
+        self._server_start_exception = None
 
         def run_server_forever():
-            asyncio.run(uvicorn_server.serve())
+            try:
+                asyncio.run(uvicorn_server.serve())
+            except (SystemExit, Exception) as exc:
+                logger.debug("LightningStore server thread exiting due to %s", exc, exc_info=exc)
+                self._server_start_exception = exc
 
-        self._serving_thread = threading.Thread(target=run_server_forever, daemon=True)
-        self._serving_thread.start()
+        serving_thread = threading.Thread(target=run_server_forever, daemon=True)
+        self._serving_thread = serving_thread
+        serving_thread.start()
 
-        # Wait for /health to be available
-        if not await self._server_health_check():
+        # Wait for uvicorn to report that it has started before pinging /health.
+        start_deadline = time.time() + 10
+        while time.time() < start_deadline:
+            if uvicorn_server.started:
+                break
+            if self._server_start_exception is not None or not serving_thread.is_alive():
+                self._handle_failed_start()
+                raise RuntimeError(self._format_start_failure_reason())
+            await asyncio.sleep(0.05)
+        else:
+            self._handle_failed_start()
             raise RuntimeError("Server failed to start within the 10 seconds.")
+
+        # Wait for /health to be available once uvicorn reports started.
+        if not await self._server_health_check():
+            self._handle_failed_start()
+            raise RuntimeError("Server failed to start within the 10 seconds.")
+
+        # If startup failed (e.g. port already in use), uvicorn never flips `started`
+        # and the worker thread stops immediately. Guard against latching on to a
+        # different process that happened to satisfy the health check.
+        if not uvicorn_server.started or not serving_thread.is_alive() or self._server_start_exception is not None:
+            self._handle_failed_start()
+            failure_reason = self._format_start_failure_reason()
+            raise RuntimeError(failure_reason)
 
     async def _server_health_check(self) -> bool:
         """Checks if the server is healthy."""
@@ -184,11 +459,30 @@ class LightningStoreServer(LightningStore):
         while time.time() - current_time < 10:
             async with aiohttp.ClientSession() as session:
                 with suppress(Exception):
-                    async with session.get(f"{self.endpoint}/health") as response:
+                    async with session.get(f"{self.endpoint}{API_V1_AGL_PREFIX}/health") as response:
                         if response.status == 200:
                             return True
             await asyncio.sleep(0.1)
         return False
+
+    def _handle_failed_start(self) -> None:
+        """Clean up thread state when startup fails."""
+        if self._uvicorn_server is not None:
+            self._uvicorn_server.should_exit = True
+        if self._serving_thread is not None:
+            # Thread already exited in most failure scenarios; join defensively.
+            self._serving_thread.join(timeout=0.1)
+            self._serving_thread = None
+
+    def _format_start_failure_reason(self) -> str:
+        base_message = f"LightningStore server failed to start on {self.endpoint}."
+        if isinstance(self._server_start_exception, SystemExit):
+            return f"{base_message} Another process may already be using this port."
+        if isinstance(self._server_start_exception, OSError):
+            return f"{base_message} {self._server_start_exception.strerror}."
+        if self._server_start_exception is not None:
+            return f"{base_message} Reason: {self._server_start_exception}."
+        return f"{base_message} Another process may already be using this port."
 
     async def run_forever(self):
         """Runs the FastAPI server indefinitely.
@@ -196,6 +490,7 @@ class LightningStoreServer(LightningStore):
         You need to call this method in the same process as the server was created in.
         """
         assert self._uvicorn_server is not None
+        uvicorn_server = self._uvicorn_server
 
         async def _wait_till_healthy():
             health = await self._server_health_check()
@@ -203,9 +498,30 @@ class LightningStoreServer(LightningStore):
                 raise RuntimeError("Server did not become healthy within the 10 seconds.")
             logger.info("Store server is online at %s", self.endpoint)
 
+        async def _serve_capture():
+            try:
+                await uvicorn_server.serve()
+            except KeyboardInterrupt:
+                raise
+            except (SystemExit, Exception) as exc:
+                logger.debug("LightningStore server serve() raised %s", exc, exc_info=exc)
+                self._server_start_exception = exc
+                raise RuntimeError("LightningStore server failed to serve") from exc
+
         # We run _wait_till_healthy and self._uvicorn_server.serve in parallel
         # until one of them raises an exception.
-        await asyncio.gather(_wait_till_healthy(), self._uvicorn_server.serve())
+        try:
+            await asyncio.gather(_wait_till_healthy(), _serve_capture())
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            startup_failed = not uvicorn_server.started or isinstance(
+                self._server_start_exception, (SystemExit, OSError)
+            )
+            if startup_failed:
+                self._handle_failed_start()
+                raise RuntimeError(self._format_start_failure_reason())
+            raise
 
     async def stop(self):
         """Gracefully stops the running FastAPI server.
@@ -237,30 +553,44 @@ class LightningStoreServer(LightningStore):
         """Set up FastAPI routes for all store operations."""
         assert self.app is not None
 
-        @self.app.exception_handler(Exception)
-        async def _app_exception_handler(request: Request, exc: Exception):  # pyright: ignore[reportUnusedFunction]
+        @self.app.middleware("http")
+        async def _app_exception_handler(  # pyright: ignore[reportUnusedFunction]
+            request: Request, call_next: Callable[[Request], Awaitable[Response]]
+        ) -> Response:
             """
-            Convert unhandled application exceptions into 400 responses.
+            Convert unhandled application exceptions into 500 responses.
+
+            Only covers /v1/agl requests.
 
             - Client needs a reliable signal to distinguish "app bug / bad request"
               from transport/session failures.
-            - 400 here means "do not retry"; network issues will surface as aiohttp
+            - 400 means "do not retry"; network issues will surface as aiohttp
               exceptions or 5xx and will be retried by the client shield.
             """
-            logger.exception("Unhandled application error", exc_info=exc)
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "detail": str(exc),
-                    "error_type": type(exc).__name__,
-                    "traceback": traceback.format_exc(),
-                },
-            )
+            try:
+                return await call_next(request)
+            except Exception as exc:
+                # decide whether to convert this into your 400 JSONResponse
+                if request.url.path.startswith(API_V1_AGL_PREFIX):
+                    logger.exception("Unhandled application error", exc_info=exc)
+                    payload = {
+                        "detail": "Internal server error",
+                        "error_type": type(exc).__name__,
+                        "traceback": traceback.format_exc(),
+                    }
+                    # 500 so clients can decide to retry
+                    return JSONResponse(status_code=500, content=payload)
+                # otherwise re-raise and let FastAPI/Starlette handle it (500 or other handlers)
+                raise
 
         @self.app.middleware("http")
         async def _log_time(  # pyright: ignore[reportUnusedFunction]
             request: Request, call_next: Callable[[Request], Awaitable[Response]]
         ):
+            # If not API request, just pass through
+            if not request.url.path.startswith(API_V1_AGL_PREFIX):
+                return await call_next(request)
+
             start = time.perf_counter()
             response = await call_next(request)
             duration = (time.perf_counter() - start) * 1000
@@ -276,21 +606,13 @@ class LightningStoreServer(LightningStore):
             )
             return response
 
-        @self.app.get("/health")
+        api = APIRouter(prefix=API_V1_PREFIX)
+
+        @api.get(API_AGL_PREFIX + "/health")
         async def health():  # pyright: ignore[reportUnusedFunction]
             return {"status": "ok"}
 
-        @self.app.post("/start_rollout", response_model=AttemptedRollout)
-        async def start_rollout(request: RolloutRequest):  # pyright: ignore[reportUnusedFunction]
-            return await self.start_rollout(
-                input=request.input,
-                mode=request.mode,
-                resources_id=request.resources_id,
-                config=request.config,
-                metadata=request.metadata,
-            )
-
-        @self.app.post("/enqueue_rollout", response_model=Rollout)
+        @api.post(API_AGL_PREFIX + "/queues/rollouts/enqueue", status_code=201, response_model=Rollout)
         async def enqueue_rollout(request: RolloutRequest):  # pyright: ignore[reportUnusedFunction]
             return await self.enqueue_rollout(
                 input=request.input,
@@ -300,88 +622,290 @@ class LightningStoreServer(LightningStore):
                 metadata=request.metadata,
             )
 
-        @self.app.get("/dequeue_rollout", response_model=Optional[AttemptedRollout])
-        async def dequeue_rollout():  # pyright: ignore[reportUnusedFunction]
-            return await self.dequeue_rollout()
+        @api.post(API_AGL_PREFIX + "/queues/rollouts/dequeue", response_model=Optional[AttemptedRollout])
+        async def dequeue_rollout(  # pyright: ignore[reportUnusedFunction]
+            request: DequeueRolloutRequest | None = Body(None),
+        ):
+            worker_id = request.worker_id if request else None
+            return await self.dequeue_rollout(worker_id=worker_id)
 
-        @self.app.post("/start_attempt", response_model=AttemptedRollout)
-        async def start_attempt(request: RolloutId):  # pyright: ignore[reportUnusedFunction]
-            return await self.start_attempt(request.rollout_id)
+        @api.post(API_AGL_PREFIX + "/rollouts", status_code=201, response_model=AttemptedRollout)
+        async def start_rollout(request: RolloutRequest):  # pyright: ignore[reportUnusedFunction]
+            return await self.start_rollout(
+                input=request.input,
+                mode=request.mode,
+                resources_id=request.resources_id,
+                config=request.config,
+                metadata=request.metadata,
+            )
 
-        @self.app.post("/query_rollouts", response_model=List[Rollout])
-        async def query_rollouts(request: QueryRolloutsRequest):  # pyright: ignore[reportUnusedFunction]
-            return await self.query_rollouts(status=request.status, rollout_ids=request.rollout_ids)
+        @api.get(API_AGL_PREFIX + "/rollouts", response_model=PaginatedResponse[Union[AttemptedRollout, Rollout]])
+        async def query_rollouts(params: QueryRolloutsRequest = Depends()):  # pyright: ignore[reportUnusedFunction]
+            # Get all rollouts from the underlying store
+            all_rollouts = await self.query_rollouts()
 
-        @self.app.get("/query_attempts/{rollout_id}", response_model=List[Attempt])
-        async def query_attempts(rollout_id: str):  # pyright: ignore[reportUnusedFunction]
-            return await self.query_attempts(rollout_id)
+            # Build filter dict
+            filters: Dict[str, Any] = {}
+            if params.status_in:
+                filters["status_in"] = params.status_in
+            if params.rollout_id_in:
+                filters["rollout_id_in"] = params.rollout_id_in
+            if params.rollout_id_contains is not None:
+                filters["rollout_id_contains"] = params.rollout_id_contains
 
-        @self.app.get("/get_latest_attempt/{rollout_id}", response_model=Optional[Attempt])
-        async def get_latest_attempt(rollout_id: str):  # pyright: ignore[reportUnusedFunction]
-            return await self.get_latest_attempt(rollout_id)
+            return _apply_filters_sort_paginate(
+                all_rollouts,
+                filters,
+                params.filter_logic,
+                params.sort_by,
+                params.sort_order,
+                params.limit,
+                params.offset,
+            )
 
-        @self.app.get("/get_rollout_by_id/{rollout_id}", response_model=Optional[Rollout])
+        @api.get(API_AGL_PREFIX + "/rollouts/{rollout_id}", response_model=Union[AttemptedRollout, Rollout])
         async def get_rollout_by_id(rollout_id: str):  # pyright: ignore[reportUnusedFunction]
             return await self.get_rollout_by_id(rollout_id)
 
-        @self.app.post("/add_resources", response_model=ResourcesUpdate)
-        async def add_resources(resources: AddResourcesRequest):  # pyright: ignore[reportUnusedFunction]
-            return await self.add_resources(resources.resources)
+        def _get_mandatory_field_or_unset(request: BaseModel | None, field: str) -> Any:
+            # If some fields are mandatory by the underlying store, but optional in the FastAPI,
+            # we make sure it's set to non-null value or UNSET via this function.
+            if request is None:
+                return UNSET
+            if field in request.model_fields_set:
+                value = getattr(request, field)
+                if value is None:
+                    raise HTTPException(status_code=400, detail=f"{field} is invalid; it cannot be a null value.")
+                return value
+            else:
+                return UNSET
 
-        @self.app.post("/update_resources", response_model=ResourcesUpdate)
-        async def update_resources(update: ResourcesUpdate):  # pyright: ignore[reportUnusedFunction]
-            return await self.update_resources(update.resources_id, update.resources)
+        @api.post(API_AGL_PREFIX + "/rollouts/{rollout_id}", response_model=Rollout)
+        async def update_rollout(  # pyright: ignore[reportUnusedFunction]
+            rollout_id: str, request: UpdateRolloutRequest = Body(...)
+        ):
+            return await self.update_rollout(
+                rollout_id=rollout_id,
+                input=request.input if "input" in request.model_fields_set else UNSET,
+                mode=request.mode if "mode" in request.model_fields_set else UNSET,
+                resources_id=request.resources_id if "resources_id" in request.model_fields_set else UNSET,
+                status=_get_mandatory_field_or_unset(request, "status"),
+                config=_get_mandatory_field_or_unset(request, "config"),
+                metadata=request.metadata if "metadata" in request.model_fields_set else UNSET,
+            )
 
-        @self.app.get("/get_resources_by_id/{resources_id}", response_model=Optional[ResourcesUpdate])
-        async def get_resources_by_id(resources_id: str):  # pyright: ignore[reportUnusedFunction]
-            return await self.get_resources_by_id(resources_id)
+        @api.post(API_AGL_PREFIX + "/rollouts/{rollout_id}/attempts", status_code=201, response_model=AttemptedRollout)
+        async def start_attempt(rollout_id: str):  # pyright: ignore[reportUnusedFunction]
+            return await self.start_attempt(rollout_id)
 
-        @self.app.get("/get_latest_resources", response_model=Optional[ResourcesUpdate])
+        @api.post(API_AGL_PREFIX + "/rollouts/{rollout_id}/attempts/{attempt_id}", response_model=Attempt)
+        async def update_attempt(  # pyright: ignore[reportUnusedFunction]
+            rollout_id: str, attempt_id: str, request: UpdateAttemptRequest = Body(...)
+        ):
+            return await self.update_attempt(
+                rollout_id=rollout_id,
+                attempt_id=attempt_id,
+                status=_get_mandatory_field_or_unset(request, "status"),
+                worker_id=_get_mandatory_field_or_unset(request, "worker_id"),
+                last_heartbeat_time=_get_mandatory_field_or_unset(request, "last_heartbeat_time"),
+                metadata=_get_mandatory_field_or_unset(request, "metadata"),
+            )
+
+        @api.get(API_AGL_PREFIX + "/workers", response_model=PaginatedResponse[Worker])
+        async def query_workers(params: QueryWorkersRequest = Depends()):  # pyright: ignore[reportUnusedFunction]
+            all_workers = await self.query_workers()
+
+            filters: Dict[str, Any] = {}
+            if params.status_in:
+                filters["status_in"] = params.status_in
+            if params.worker_id_contains is not None:
+                filters["worker_id_contains"] = params.worker_id_contains
+
+            return _apply_filters_sort_paginate(
+                all_workers,
+                filters,
+                params.filter_logic,
+                params.sort_by,
+                params.sort_order,
+                params.limit,
+                params.offset,
+            )
+
+        @api.get(API_AGL_PREFIX + "/workers/{worker_id}", response_model=Optional[Worker])
+        async def get_worker(worker_id: str):  # pyright: ignore[reportUnusedFunction]
+            return await self.get_worker_by_id(worker_id)
+
+        @api.post(API_AGL_PREFIX + "/workers/{worker_id}", response_model=Worker)
+        async def update_worker(  # pyright: ignore[reportUnusedFunction]
+            worker_id: str, request: UpdateWorkerRequest | None = Body(None)
+        ):
+            return await self.update_worker(
+                worker_id=worker_id,
+                heartbeat_stats=_get_mandatory_field_or_unset(request, "heartbeat_stats"),
+            )
+
+        @api.get(API_AGL_PREFIX + "/rollouts/{rollout_id}/attempts", response_model=PaginatedResponse[Attempt])
+        async def query_attempts(  # pyright: ignore[reportUnusedFunction]
+            rollout_id: str, params: QueryAttemptsRequest = Depends()
+        ):
+            # Get all attempts for the rollout
+            all_attempts = await self.query_attempts(rollout_id)
+
+            return _apply_filters_sort_paginate(
+                all_attempts,
+                {},  # No filters for attempts
+                "and",
+                params.sort_by,
+                params.sort_order,
+                params.limit,
+                params.offset,
+            )
+
+        @api.get(API_AGL_PREFIX + "/rollouts/{rollout_id}/attempts/latest", response_model=Optional[Attempt])
+        async def get_latest_attempt(rollout_id: str):  # pyright: ignore[reportUnusedFunction]
+            return await self.get_latest_attempt(rollout_id)
+
+        @api.get(API_AGL_PREFIX + "/resources", response_model=PaginatedResponse[ResourcesUpdate])
+        async def query_resources(params: QueryResourcesRequest = Depends()):  # pyright: ignore[reportUnusedFunction]
+            # Get all resources
+            all_resources = await self.query_resources()
+
+            # Build filter dict
+            filters: Dict[str, Any] = {}
+            if params.resources_id is not None:
+                filters["resources_id"] = params.resources_id
+            if params.resources_id_contains is not None:
+                filters["resources_id_contains"] = params.resources_id_contains
+
+            return _apply_filters_sort_paginate(
+                all_resources,
+                filters,
+                "and",
+                params.sort_by,
+                params.sort_order,
+                params.limit,
+                params.offset,
+            )
+
+        @api.post(API_AGL_PREFIX + "/resources", status_code=201, response_model=ResourcesUpdate)
+        async def add_resources(resources: NamedResources):  # pyright: ignore[reportUnusedFunction]
+            return await self.add_resources(resources)
+
+        @api.get(API_AGL_PREFIX + "/resources/latest", response_model=Optional[ResourcesUpdate])
         async def get_latest_resources():  # pyright: ignore[reportUnusedFunction]
             return await self.get_latest_resources()
 
-        @self.app.post("/add_span", response_model=Span)
+        @api.post(API_AGL_PREFIX + "/resources/{resources_id}", response_model=ResourcesUpdate)
+        async def update_resources(  # pyright: ignore[reportUnusedFunction]
+            resources_id: str, resources: NamedResources
+        ):
+            return await self.update_resources(resources_id, resources)
+
+        @api.get(API_AGL_PREFIX + "/resources/{resources_id}", response_model=Optional[ResourcesUpdate])
+        async def get_resources_by_id(resources_id: str):  # pyright: ignore[reportUnusedFunction]
+            return await self.get_resources_by_id(resources_id)
+
+        @api.post(API_AGL_PREFIX + "/spans", status_code=201, response_model=Span)
         async def add_span(span: Span):  # pyright: ignore[reportUnusedFunction]
             return await self.add_span(span)
 
-        @self.app.get("/get_next_span_sequence_id/{rollout_id}/{attempt_id}", response_model=int)
-        async def get_next_span_sequence_id(rollout_id: str, attempt_id: str):  # pyright: ignore[reportUnusedFunction]
-            return await self.get_next_span_sequence_id(rollout_id, attempt_id)
+        @api.get(API_AGL_PREFIX + "/spans", response_model=PaginatedResponse[Span])
+        async def query_spans(params: QuerySpansRequest = Depends()):  # pyright: ignore[reportUnusedFunction]
+            # Get all spans for the rollout/attempt
+            all_spans = await self.query_spans(params.rollout_id, params.attempt_id)
 
-        @self.app.post("/wait_for_rollouts", response_model=List[Rollout])
+            # Build filter dict
+            filters: Dict[str, Any] = {}
+            if params.trace_id is not None:
+                filters["trace_id"] = params.trace_id
+            if params.trace_id_contains is not None:
+                filters["trace_id_contains"] = params.trace_id_contains
+            if params.span_id is not None:
+                filters["span_id"] = params.span_id
+            if params.span_id_contains is not None:
+                filters["span_id_contains"] = params.span_id_contains
+            if params.parent_id is not None:
+                filters["parent_id"] = params.parent_id
+            if params.parent_id_contains is not None:
+                filters["parent_id_contains"] = params.parent_id_contains
+            if params.name is not None:
+                filters["name"] = params.name
+            if params.name_contains is not None:
+                filters["name_contains"] = params.name_contains
+
+            return _apply_filters_sort_paginate(
+                all_spans, filters, params.filter_logic, params.sort_by, params.sort_order, params.limit, params.offset
+            )
+
+        @api.post(API_AGL_PREFIX + "/spans/next", response_model=NextSequenceIdResponse)
+        async def get_next_span_sequence_id(request: NextSequenceIdRequest):  # pyright: ignore[reportUnusedFunction]
+            sequence_id = await self.get_next_span_sequence_id(request.rollout_id, request.attempt_id)
+            return NextSequenceIdResponse(sequence_id=sequence_id)
+
+        @api.post(API_AGL_PREFIX + "/waits/rollouts", response_model=List[Rollout])
         async def wait_for_rollouts(request: WaitForRolloutsRequest):  # pyright: ignore[reportUnusedFunction]
             return await self.wait_for_rollouts(rollout_ids=request.rollout_ids, timeout=request.timeout)
 
-        @self.app.get("/query_spans/{rollout_id}", response_model=List[Span])
-        async def query_spans(  # pyright: ignore[reportUnusedFunction]
-            rollout_id: str, attempt_id: Optional[str] = None
-        ):
-            return await self.query_spans(rollout_id, attempt_id)
+        # Reserved methods for OTEL traces
+        # https://opentelemetry.io/docs/specs/otlp/#otlphttp-request
+        @api.post("/traces")
+        async def otlp_traces():  # pyright: ignore[reportUnusedFunction]
+            return Response(status_code=501)
 
-        @self.app.post("/update_rollout", response_model=Rollout)
-        async def update_rollout(request: UpdateRolloutRequest):  # pyright: ignore[reportUnusedFunction]
-            return await self.update_rollout(
-                rollout_id=request.rollout_id,
-                input=request.input if not isinstance(request.input, PydanticUnset) else UNSET,
-                mode=request.mode if not isinstance(request.mode, PydanticUnset) else UNSET,
-                resources_id=request.resources_id if not isinstance(request.resources_id, PydanticUnset) else UNSET,
-                status=request.status if not isinstance(request.status, PydanticUnset) else UNSET,
-                config=request.config if not isinstance(request.config, PydanticUnset) else UNSET,
-                metadata=request.metadata if not isinstance(request.metadata, PydanticUnset) else UNSET,
-            )
+        @api.post("/metrics")
+        async def otlp_metrics():  # pyright: ignore[reportUnusedFunction]
+            return Response(status_code=501)
 
-        @self.app.post("/update_attempt", response_model=Attempt)
-        async def update_attempt(request: UpdateAttemptRequest):  # pyright: ignore[reportUnusedFunction]
-            return await self.update_attempt(
-                rollout_id=request.rollout_id,
-                attempt_id=request.attempt_id,
-                status=request.status if not isinstance(request.status, PydanticUnset) else UNSET,
-                worker_id=request.worker_id if not isinstance(request.worker_id, PydanticUnset) else UNSET,
-                last_heartbeat_time=(
-                    request.last_heartbeat_time if not isinstance(request.last_heartbeat_time, PydanticUnset) else UNSET
-                ),
-                metadata=request.metadata if not isinstance(request.metadata, PydanticUnset) else UNSET,
+        @api.post("/logs")
+        async def otlp_logs():  # pyright: ignore[reportUnusedFunction]
+            return Response(status_code=501)
+
+        @api.post("/development/profiles")
+        async def otlp_development_profiles():  # pyright: ignore[reportUnusedFunction]
+            return Response(status_code=501)
+
+        # Mount the API router of /v1/...
+        self.app.include_router(api)
+
+        # Finally, mount the dashboard assets
+        self._setup_dashboard()
+
+    def _setup_dashboard(self):
+        """Setup the dashboard static files and SPA."""
+        assert self.app is not None
+
+        dashboard_dir = (Path(__file__).parent.parent / "dashboard").resolve()
+        if not dashboard_dir.exists():
+            logger.error("Dashboard directory not found at %s. Please build the dashboard first.", dashboard_dir)
+            return
+
+        dashboard_assets_dir = dashboard_dir / "assets"
+        if not dashboard_assets_dir.exists():
+            logger.error(
+                "Dashboard assets directory not found at %s. Please build the dashboard first.", dashboard_assets_dir
             )
+            return
+
+        index_file = dashboard_dir / "index.html"
+        if not index_file.exists():
+            logger.error("Dashboard index file not found at %s. Please build the dashboard first.", index_file)
+            return
+
+        # Mount the static files in dashboard/assets
+        self.app.mount("/assets", CachedStaticFiles(directory=dashboard_assets_dir), name="assets")
+
+        # SPA fallback (client-side routing)
+        # Anything that's not /v1/* or a real file in /assets will serve index.html
+        @self.app.get("/", include_in_schema=False)
+        def root():  # pyright: ignore[reportUnusedFunction]
+            return FileResponse(index_file)
+
+        @self.app.get("/{full_path:path}", include_in_schema=False)
+        def spa_fallback(full_path: str):  # pyright: ignore[reportUnusedFunction]
+            # Let the frontend router handle it
+            return FileResponse(index_file)
+
+        logger.info("Agent-lightning dashboard will be available at %s", self.endpoint)
 
     # Delegate methods
     async def _call_store_method(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
@@ -430,8 +954,8 @@ class LightningStoreServer(LightningStore):
             metadata,
         )
 
-    async def dequeue_rollout(self) -> Optional[AttemptedRollout]:
-        return await self._call_store_method("dequeue_rollout")
+    async def dequeue_rollout(self, worker_id: Optional[str] = None) -> Optional[AttemptedRollout]:
+        return await self._call_store_method("dequeue_rollout", worker_id)
 
     async def start_attempt(self, rollout_id: str) -> AttemptedRollout:
         return await self._call_store_method("start_attempt", rollout_id)
@@ -446,6 +970,9 @@ class LightningStoreServer(LightningStore):
 
     async def get_latest_attempt(self, rollout_id: str) -> Optional[Attempt]:
         return await self._call_store_method("get_latest_attempt", rollout_id)
+
+    async def query_resources(self) -> List[ResourcesUpdate]:
+        return await self._call_store_method("query_resources")
 
     async def get_rollout_by_id(self, rollout_id: str) -> Optional[Rollout]:
         return await self._call_store_method("get_rollout_by_id", rollout_id)
@@ -533,6 +1060,23 @@ class LightningStoreServer(LightningStore):
             metadata,
         )
 
+    async def query_workers(self) -> List[Worker]:
+        return await self._call_store_method("query_workers")
+
+    async def get_worker_by_id(self, worker_id: str) -> Optional[Worker]:
+        return await self._call_store_method("get_worker_by_id", worker_id)
+
+    async def update_worker(
+        self,
+        worker_id: str,
+        heartbeat_stats: Dict[str, Any] | Unset = UNSET,
+    ) -> Worker:
+        return await self._call_store_method(
+            "update_worker",
+            worker_id,
+            heartbeat_stats,
+        )
+
 
 class LightningStoreClient(LightningStore):
     """HTTP client that talks to a remote LightningStoreServer.
@@ -553,7 +1097,7 @@ class LightningStoreClient(LightningStore):
         retry_delays: Sequence[float] = (1.0, 2.0, 5.0),
         health_retry_delays: Sequence[float] = (0.1, 0.2, 0.5),
     ):
-        self.server_address = server_address.rstrip("/")
+        self.server_address = server_address.rstrip("/") + API_V1_AGL_PREFIX
         self._sessions: Dict[int, aiohttp.ClientSession] = {}  # id(loop) -> ClientSession
         self._lock = threading.RLock()
 
@@ -564,6 +1108,14 @@ class LightningStoreClient(LightningStore):
         # Store whether the dequeue was successful in history
         self._dequeue_was_successful: bool = False
         self._dequeue_first_unsuccessful: bool = True
+
+    def capabilities(self) -> LightningStoreCapabilities:
+        """Return the capabilities of the store."""
+        return LightningStoreCapabilities(
+            thread_safe=True,
+            async_safe=True,
+            zero_copy=True,
+        )
 
     def __getstate__(self):
         """
@@ -647,6 +1199,7 @@ class LightningStoreClient(LightningStore):
         path: str,
         *,
         json: Any | None = None,
+        params: Dict[str, Any] | None = None,
     ) -> Any:
         """
         Make an HTTP request with:
@@ -672,11 +1225,11 @@ class LightningStoreClient(LightningStore):
                 await asyncio.sleep(delay)
             try:
                 http_call = getattr(session, method)
-                async with http_call(url, json=json) as resp:
+                async with http_call(url, json=json, params=params) as resp:
                     resp.raise_for_status()
                     return await resp.json()
             except aiohttp.ClientResponseError as cre:
-                # Respect app-level 4xx as final (server marks app faults as 400)
+                # Respect app-level 4xx as final
                 # 4xx => application issue; do not retry (except 408 which is transient)
                 logger.debug(f"ClientResponseError: {cre.status} {cre.message}", exc_info=True)
                 if 400 <= cre.status < 500 and cre.status != 408:
@@ -735,7 +1288,7 @@ class LightningStoreClient(LightningStore):
     ) -> AttemptedRollout:
         data = await self._request_json(
             "post",
-            "/start_rollout",
+            "/rollouts",
             json=RolloutRequest(
                 input=input,
                 mode=mode,
@@ -756,7 +1309,7 @@ class LightningStoreClient(LightningStore):
     ) -> Rollout:
         data = await self._request_json(
             "post",
-            "/enqueue_rollout",
+            "/queues/rollouts/enqueue",
             json=RolloutRequest(
                 input=input,
                 mode=mode,
@@ -767,7 +1320,7 @@ class LightningStoreClient(LightningStore):
         )
         return Rollout.model_validate(data)
 
-    async def dequeue_rollout(self) -> Optional[AttemptedRollout]:
+    async def dequeue_rollout(self, worker_id: Optional[str] = None) -> Optional[AttemptedRollout]:
         """
         Dequeue a rollout from the server queue.
 
@@ -779,9 +1332,12 @@ class LightningStoreClient(LightningStore):
             server error, etc.), it logs the error and returns None immediately.
         """
         session = await self._get_session()
-        url = f"{self.server_address}/dequeue_rollout"
+        url = f"{self.server_address}/queues/rollouts/dequeue"
+        request_kwargs: Dict[str, Any] = {}
+        if worker_id is not None:
+            request_kwargs["json"] = {"worker_id": worker_id}
         try:
-            async with session.get(url) as resp:
+            async with session.post(url, **request_kwargs) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
                 self._dequeue_was_successful = True
@@ -798,27 +1354,34 @@ class LightningStoreClient(LightningStore):
     async def start_attempt(self, rollout_id: str) -> AttemptedRollout:
         data = await self._request_json(
             "post",
-            "/start_attempt",
-            json=RolloutId(rollout_id=rollout_id).model_dump(),
+            f"/rollouts/{rollout_id}/attempts",
         )
         return AttemptedRollout.model_validate(data)
 
     async def query_rollouts(
         self, *, status: Optional[Sequence[RolloutStatus]] = None, rollout_ids: Optional[Sequence[str]] = None
     ) -> List[Rollout]:
-        data = await self._request_json(
-            "post",
-            "/query_rollouts",
-            json=QueryRolloutsRequest(
-                status=list(status) if status else None,
-                rollout_ids=list(rollout_ids) if rollout_ids else None,
-            ).model_dump(),
-        )
-        return [Rollout.model_validate(item) for item in data]
+        params: Dict[str, Any] = {}
+        if status is not None:
+            params["status_in"] = status
+        if rollout_ids is not None:
+            params["rollout_id_in"] = list(rollout_ids)
+
+        data = await self._request_json("get", "/rollouts", params=params if params else None)
+        # Extract items from PaginatedResponse
+        return [
+            (
+                AttemptedRollout.model_validate(item)
+                if isinstance(item, dict) and "attempt" in item
+                else Rollout.model_validate(item)
+            )
+            for item in data["items"]
+        ]
 
     async def query_attempts(self, rollout_id: str) -> List[Attempt]:
-        data = await self._request_json("get", f"/query_attempts/{rollout_id}")
-        return [Attempt.model_validate(item) for item in data]
+        data = await self._request_json("get", f"/rollouts/{rollout_id}/attempts")
+        # Extract items from PaginatedResponse
+        return [Attempt.model_validate(item) for item in data["items"]]
 
     async def get_latest_attempt(self, rollout_id: str) -> Optional[Attempt]:
         """
@@ -835,7 +1398,7 @@ class LightningStoreClient(LightningStore):
             If all retries fail, it logs the error and returns None instead of raising an exception.
         """
         try:
-            data = await self._request_json("get", f"/get_latest_attempt/{rollout_id}")
+            data = await self._request_json("get", f"/rollouts/{rollout_id}/attempts/latest")
             return Attempt.model_validate(data) if data else None
         except Exception as e:
             logger.error(f"get_latest_attempt failed after all retries for rollout_id={rollout_id}: {e}", exc_info=True)
@@ -856,22 +1419,32 @@ class LightningStoreClient(LightningStore):
             If all retries fail, it logs the error and returns None instead of raising an exception.
         """
         try:
-            data = await self._request_json("get", f"/get_rollout_by_id/{rollout_id}")
-            return Rollout.model_validate(data) if data else None
+            data = await self._request_json("get", f"/rollouts/{rollout_id}")
+            if isinstance(data, dict) and "attempt" in data:
+                return AttemptedRollout.model_validate(data)
+            else:
+                return Rollout.model_validate(data)
         except Exception as e:
             logger.error(f"get_rollout_by_id failed after all retries for rollout_id={rollout_id}: {e}", exc_info=True)
             return None
 
+    async def query_resources(self) -> List[ResourcesUpdate]:
+        """
+        List all resource snapshots stored on the server.
+        """
+        data = await self._request_json("get", "/resources")
+        if not data:
+            return []
+        # Extract items from PaginatedResponse
+        return [ResourcesUpdate.model_validate(item) for item in data["items"]]
+
     async def add_resources(self, resources: NamedResources) -> ResourcesUpdate:
-        request = AddResourcesRequest(resources=resources)
-        data = await self._request_json("post", "/add_resources", json=request.model_dump())
+        data = await self._request_json("post", "/resources", json=TypeAdapter(NamedResources).dump_python(resources))
         return ResourcesUpdate.model_validate(data)
 
     async def update_resources(self, resources_id: str, resources: NamedResources) -> ResourcesUpdate:
         data = await self._request_json(
-            "post",
-            "/update_resources",
-            json=ResourcesUpdate(resources_id=resources_id, resources=resources).model_dump(),
+            "post", f"/resources/{resources_id}", json=TypeAdapter(NamedResources).dump_python(resources)
         )
         return ResourcesUpdate.model_validate(data)
 
@@ -890,7 +1463,7 @@ class LightningStoreClient(LightningStore):
             If all retries fail, it logs the error and returns None instead of raising an exception.
         """
         try:
-            data = await self._request_json("get", f"/get_resources_by_id/{resources_id}")
+            data = await self._request_json("get", f"/resources/{resources_id}")
             return ResourcesUpdate.model_validate(data) if data else None
         except Exception as e:
             logger.error(
@@ -910,20 +1483,24 @@ class LightningStoreClient(LightningStore):
             If all retries fail, it logs the error and returns None instead of raising an exception.
         """
         try:
-            data = await self._request_json("get", "/get_latest_resources")
+            data = await self._request_json("get", "/resources/latest")
             return ResourcesUpdate.model_validate(data) if data else None
         except Exception as e:
             logger.error(f"get_latest_resources failed after all retries: {e}", exc_info=True)
             return None
 
     async def add_span(self, span: Span) -> Span:
-        data = await self._request_json("post", "/add_span", json=span.model_dump(mode="json"))
+        data = await self._request_json("post", "/spans", json=span.model_dump(mode="json"))
         return Span.model_validate(data)
 
     async def get_next_span_sequence_id(self, rollout_id: str, attempt_id: str) -> int:
-        data = await self._request_json("get", f"/get_next_span_sequence_id/{rollout_id}/{attempt_id}")
-        # endpoint returns a plain JSON number
-        return int(data)
+        data = await self._request_json(
+            "post",
+            "/spans/next",
+            json=NextSequenceIdRequest(rollout_id=rollout_id, attempt_id=attempt_id).model_dump(),
+        )
+        response = NextSequenceIdResponse.model_validate(data)
+        return response.sequence_id
 
     async def add_otel_span(
         self,
@@ -960,7 +1537,7 @@ class LightningStoreClient(LightningStore):
             )
         data = await self._request_json(
             "post",
-            "/wait_for_rollouts",
+            "/waits/rollouts",
             json=WaitForRolloutsRequest(rollout_ids=rollout_ids, timeout=timeout).model_dump(),
         )
         return [Rollout.model_validate(item) for item in data]
@@ -970,11 +1547,12 @@ class LightningStoreClient(LightningStore):
         rollout_id: str,
         attempt_id: str | Literal["latest"] | None = None,
     ) -> List[Span]:
-        path = f"/query_spans/{rollout_id}"
+        params: Dict[str, str] = {"rollout_id": rollout_id}
         if attempt_id is not None:
-            path += f"?attempt_id={attempt_id}"
-        data = await self._request_json("get", path)
-        return [Span.model_validate(item) for item in data]
+            params["attempt_id"] = attempt_id
+        data = await self._request_json("get", "/spans", params=params)
+        # Extract items from PaginatedResponse
+        return [Span.model_validate(item) for item in data["items"]]
 
     async def update_rollout(
         self,
@@ -986,7 +1564,7 @@ class LightningStoreClient(LightningStore):
         config: RolloutConfig | Unset = UNSET,
         metadata: Optional[Dict[str, Any]] | Unset = UNSET,
     ) -> Rollout:
-        payload: Dict[str, Any] = {"rollout_id": rollout_id}
+        payload: Dict[str, Any] = {}
         if not isinstance(input, Unset):
             payload["input"] = input
         if not isinstance(mode, Unset):
@@ -1000,7 +1578,7 @@ class LightningStoreClient(LightningStore):
         if not isinstance(metadata, Unset):
             payload["metadata"] = metadata
 
-        data = await self._request_json("post", "/update_rollout", json=payload)
+        data = await self._request_json("post", f"/rollouts/{rollout_id}", json=payload)
         return Rollout.model_validate(data)
 
     async def update_attempt(
@@ -1012,10 +1590,7 @@ class LightningStoreClient(LightningStore):
         last_heartbeat_time: float | Unset = UNSET,
         metadata: Optional[Dict[str, Any]] | Unset = UNSET,
     ) -> Attempt:
-        payload: Dict[str, Any] = {
-            "rollout_id": rollout_id,
-            "attempt_id": attempt_id,
-        }
+        payload: Dict[str, Any] = {}
         if not isinstance(status, Unset):
             payload["status"] = status
         if not isinstance(worker_id, Unset):
@@ -1025,5 +1600,33 @@ class LightningStoreClient(LightningStore):
         if not isinstance(metadata, Unset):
             payload["metadata"] = metadata
 
-        data = await self._request_json("post", "/update_attempt", json=payload)
+        data = await self._request_json(
+            "post",
+            f"/rollouts/{rollout_id}/attempts/{attempt_id}",
+            json=payload,
+        )
         return Attempt.model_validate(data)
+
+    async def query_workers(self) -> List[Worker]:
+        data = await self._request_json("get", "/workers")
+        items = data.get("items", [])
+        return [Worker.model_validate(item) for item in items]
+
+    async def get_worker_by_id(self, worker_id: str) -> Optional[Worker]:
+        data = await self._request_json("get", f"/workers/{worker_id}")
+        if data is None:
+            return None
+        return Worker.model_validate(data)
+
+    async def update_worker(
+        self,
+        worker_id: str,
+        heartbeat_stats: Dict[str, Any] | Unset = UNSET,
+    ) -> Worker:
+        payload: Dict[str, Any] = {}
+        if not isinstance(heartbeat_stats, Unset):
+            payload["heartbeat_stats"] = heartbeat_stats
+        json_payload = payload if payload else None
+
+        data = await self._request_json("post", f"/workers/{worker_id}", json=json_payload)
+        return Worker.model_validate(data)

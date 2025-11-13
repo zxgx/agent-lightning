@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft. All rights reserved.
 
 import asyncio
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, cast
 from unittest.mock import MagicMock
@@ -24,6 +25,7 @@ from agentlightning.types import (
     SpanContext,
     TaskInput,
     TraceStatus,
+    Worker,
 )
 
 from .dummy_store import DummyLightningStore
@@ -77,7 +79,13 @@ class IncrementingResourceStore(LightningStore):
         snapshot = self.counter
         await asyncio.sleep(0.01)
         self.counter = snapshot + 1
-        return ResourcesUpdate(resources_id=f"res-{self.counter}", resources=resources)
+        return ResourcesUpdate(
+            resources_id=f"res-{self.counter}",
+            resources=resources,
+            create_time=time.time(),
+            update_time=time.time(),
+            version=1,
+        )
 
 
 def make_span(rollout_id: str, attempt_id: str, sequence_id: int = 1) -> Span:
@@ -128,7 +136,9 @@ async def test_threaded_store_delegates_all_methods() -> None:
         metadata={},
         attempt=base_attempt,
     )
-    resources_update = ResourcesUpdate(resources_id="resources-1", resources={})
+    resources_update = ResourcesUpdate(
+        resources_id="resources-1", resources={}, create_time=time.time(), update_time=time.time(), version=1
+    )
     span = make_span(rollout_id, attempt_id)
     readable_span = MagicMock(spec=ReadableSpan)
 
@@ -151,6 +161,8 @@ async def test_threaded_store_delegates_all_methods() -> None:
         last_heartbeat_time=1.5,
         metadata={"idx": 0},
     )
+    worker_list = [Worker(worker_id="worker-1", status="busy")]
+    updated_worker = Worker(worker_id="worker-1", status="idle")
 
     return_values = {
         "start_rollout": attempted_rollout,
@@ -171,6 +183,9 @@ async def test_threaded_store_delegates_all_methods() -> None:
         "query_spans": [span],
         "update_rollout": updated_rollout,
         "update_attempt": updated_attempt,
+        "query_workers": worker_list,
+        "get_worker_by_id": worker_list[0],
+        "update_worker": updated_worker,
     }
 
     dummy_store = DummyLightningStore(return_values)
@@ -222,6 +237,9 @@ async def test_threaded_store_delegates_all_methods() -> None:
         )
         == updated_attempt
     )
+    assert await threaded_store.query_workers() == worker_list
+    assert await threaded_store.get_worker_by_id("worker-1") == worker_list[0]
+    assert await threaded_store.update_worker("worker-1", heartbeat_stats={"cpu": 0.5}) == updated_worker
 
     expected_order = [
         "start_rollout",
@@ -242,6 +260,9 @@ async def test_threaded_store_delegates_all_methods() -> None:
         "query_spans",
         "update_rollout",
         "update_attempt",
+        "query_workers",
+        "get_worker_by_id",
+        "update_worker",
     ]
     assert [name for name, *_ in dummy_store.calls] == expected_order
 
@@ -298,7 +319,9 @@ async def test_threaded_store_add_resources_delegates() -> None:
         sampling_parameters={"temperature": 0.7},
     )
     resources: NamedResources = cast(NamedResources, {"main_llm": llm})
-    resources_update = ResourcesUpdate(resources_id="resources-1", resources=resources)
+    resources_update = ResourcesUpdate(
+        resources_id="resources-1", resources=resources, create_time=time.time(), update_time=time.time(), version=1
+    )
 
     return_values = {
         "add_resources": resources_update,
