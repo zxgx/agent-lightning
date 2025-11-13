@@ -15,14 +15,14 @@ from utils.logger import logger
 
 from agentlightning import (
     InMemoryLightningStore,
+    LightningStoreServer,
     LitAgentRunner,
     LlmProxyTraceToTriplet,
     OtelTracer,
-    Trainer,
     configure_logger,
 )
 from agentlightning.litagent import LitAgent
-from agentlightning.llm_proxy import LLMProxy
+from agentlightning.llm_proxy import LLMProxy, ModelConfig
 from agentlightning.types import LLM, AttemptedRollout, NamedResources, ProxyLLM, Rollout, RolloutRawResult
 
 
@@ -160,52 +160,42 @@ class CodingAgent(LitAgent):
         return proxy_llm.with_attempted_rollout(rollout)
 
 
-async def cc_agent_dry_run_sample(model_path, server_address) -> None:
+async def cc_agent_dry_run_sample(model_path, server_address, dataset_path, sonnet_name, haiku_name) -> None:
     """Run a dry run of the cc agent on a single sample.
 
     This is a simple test function that runs the math agent on the first 4 problems
     using a single worker. Useful for testing the setup and configuration.
     """
-    dataset = load_dataset(limit=4)
+    dataset = load_dataset(dataset_path, limit=4)
     logging = configure_logger(name="Claude Code Agent")
 
     tracer = OtelTracer()
     runner = LitAgentRunner(tracer)
-    store = InMemoryLightningStore()
     adapter = LlmProxyTraceToTriplet()
+    store = LightningStoreServer(InMemoryLightningStore(), host="0.0.0.0", port=7654)
+    llm_proxy = LLMProxy(port=12358, store=store)
 
-    llm_proxy = LLMProxy(
-        port=12358,
-        litellm_config={
-            "general_settings": {
-                "master_key": os.environ.get("ANTHROPIC_AUTH_TOKEN", "dummy"),
-                # "forward_client_headers_to_llm_api": True,
-            }
-        },
+    await store.start()
+
+    llm_proxy.update_model_list(
+        [
+            ModelConfig(
+                model_name=f"{sonnet_name}",
+                litellm_params={
+                    "model": f"hosted_vllm/{model_path}",
+                    "api_base": server_address,
+                },
+            ),
+            ModelConfig(
+                model_name=f"{haiku_name}",
+                litellm_params={
+                    "model": f"hosted_vllm/{model_path}",
+                    "api_base": server_address,
+                },
+            ),
+        ]
     )
-    llm_proxy.set_store(store)
-
-    model_list = [
-        {
-            "model_name": "claude-sonnet-4-5-20250929",
-            "litellm_params": {
-                "model": f"hosted_vllm/{model_path}",
-                "api_base": server_address,
-            },
-        },
-        {
-            "model_name": "claude-haiku-4-5-20251001",
-            "litellm_params": {
-                "model": f"hosted_vllm/{model_path}",
-                "api_base": server_address,
-            },
-        },
-    ]
-
-    llm_proxy.update_model_list(model_list)
-    # Restart the LLM proxy after backend model list update
-    # If LLM proxy has never been started, it will be started
-    llm_proxy.restart()
+    await llm_proxy.restart()
 
     # Put the LLM proxy address into the store as an address
     await store.add_resources(
@@ -228,10 +218,10 @@ async def cc_agent_dry_run_sample(model_path, server_address) -> None:
 
 
 async def gold_cc_agent_run_dataset(
-    sonnet_name="claude-sonnet-4-5-20250929",
-    haiku_name="claude-haiku-4-5-20251001",
-    dataset_path="swe_debug.jsonl",
-    output_dir="gold_logs",
+    sonnet_name,
+    haiku_name,
+    dataset_path,
+    output_dir,
 ):
     """Run a dry run of the cc agent on a single sample.
 
@@ -246,33 +236,24 @@ async def gold_cc_agent_run_dataset(
 
     tracer = OtelTracer()
     runner = LitAgentRunner(tracer)
-    store = InMemoryLightningStore()
+    store = LightningStoreServer(InMemoryLightningStore(), host="0.0.0.0", port=7654)
+    llm_proxy = LLMProxy(port=12358, store=store)
 
-    llm_proxy = LLMProxy(
-        port=12358,
-        litellm_config={
-            "general_settings": {
-                "master_key": os.environ.get("ANTHROPIC_AUTH_TOKEN", "dummy"),
-            }
-        },
+    await store.start()
+
+    llm_proxy.update_model_list(
+        [
+            ModelConfig(
+                model_name=f"{sonnet_name}",
+                litellm_params={"model": f"anthropic/{sonnet_name}", "api_key": "os.environ/ANTHROPIC_API_KEY"},
+            ),
+            ModelConfig(
+                model_name=f"{haiku_name}",
+                litellm_params={"model": f"anthropic/{haiku_name}", "api_key": "os.environ/ANTHROPIC_API_KEY"},
+            ),
+        ]
     )
-    llm_proxy.set_store(store)
-
-    model_list = [
-        {
-            "model_name": f"{sonnet_name}",
-            "litellm_params": {"model": f"anthropic/{sonnet_name}", "api_key": "os.environ/ANTHROPIC_API_KEY"},
-        },
-        {
-            "model_name": f"{haiku_name}",
-            "litellm_params": {"model": f"anthropic/{haiku_name}", "api_key": "os.environ/ANTHROPIC_API_KEY"},
-        },
-    ]
-
-    llm_proxy.update_model_list(model_list)
-    # Restart the LLM proxy after backend model list update
-    # If LLM proxy has never been started, it will be started
-    llm_proxy.restart()
+    await llm_proxy.restart()
 
     # Put the LLM proxy address into the store as an address
     await store.add_resources(
@@ -299,6 +280,12 @@ if __name__ == "__main__":
 
     parser = ArgumentParser()
     parser.add_argument("--official", action="store_true", help="Whether to run official claude code.")
+    parser.add_argument(
+        "--sonnet_name", type=str, default="claude-sonnet-4-5-20250929", help="Name of the sonnet model."
+    )
+    parser.add_argument("--haiku_name", type=str, default="claude-haiku-4-5-20251001", help="Name of the haiku model.")
+    parser.add_argument("--dataset_path", type=str, default="swe_debug.jsonl", help="Path to the dataset.")
+    parser.add_argument("--output_dir", type=str, default="gold_logs", help="Directory to save output logs.")
 
     args = parser.parse_args()
 
@@ -307,14 +294,17 @@ if __name__ == "__main__":
             cc_agent_dry_run_sample(
                 model_path="Qwen/Qwen3-Coder-30B-A3B-Instruct",
                 server_address="http://localhost:8000/v1",
+                dataset_path=args.dataset_path,
+                sonnet_name=args.sonnet_name,
+                haiku_name=args.haiku_name,
             )
         )
     else:
         asyncio.run(
             gold_cc_agent_run_dataset(
-                sonnet_name="claude-sonnet-4-5-20250929",
-                haiku_name="claude-haiku-4-5-20251001",
-                dataset_path="swe_debug.jsonl",
-                output_dir="gold_logs",
+                sonnet_name=args.sonnet_name,
+                haiku_name=args.haiku_name,
+                dataset_path=args.dataset_path,
+                output_dir=args.output_dir,
             )
         )
