@@ -5,7 +5,7 @@ from typing import Any, Dict
 from cc_agent import CodingAgent
 from rich.console import Console
 
-from agentlightning import LitAgentRunner, OtelTracer, configure_logger
+from agentlightning import LitAgentRunner, configure_logger
 from agentlightning.store import LightningStore, LightningStoreClient
 from agentlightning.tracer import OtelTracer
 

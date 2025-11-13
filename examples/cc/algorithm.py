@@ -136,11 +136,9 @@ async def run_epoch(
         resources_update = await store.add_resources({"llm": llm_proxy.as_resource(model="local")})
 
         rollouts: List[Rollout] = []
-        for _ in range(2):
+        for data in train_dataset:
             rollouts.append(
-                await store.enqueue_rollout(
-                    input=train_dataset[0], mode="train", resources_id=resources_update.resources_id
-                )
+                await store.enqueue_rollout(input=data, mode="train", resources_id=resources_update.resources_id)
             )
 
         console.print(f"[bold red][Algo][/bold red] Enqueued {len(rollouts)} rollouts")
@@ -195,7 +193,7 @@ async def run_algorithm(store: LightningStore, model_path: str, num_epochs: int,
     )
     data_adapter = LlmProxyTraceToTriplet()
     for epoch in range(num_epochs):
-        train_dataset = load_dataset(epoch=epoch)
+        train_dataset = load_dataset(epoch=epoch, limit=2)
         model_path = await run_epoch(
             epoch=epoch,
             store=store,
