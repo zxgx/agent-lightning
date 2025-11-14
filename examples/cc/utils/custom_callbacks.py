@@ -2,7 +2,7 @@ from typing import Any, Dict, Optional, Union
 
 from litellm.integrations.custom_logger import CustomLogger
 
-from agentlightning.llm_proxy import _get_pre_call_data
+from agentlightning.llm_proxy import _get_pre_call_data  # type: ignore
 
 
 class AddLogprobs(CustomLogger):

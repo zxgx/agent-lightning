@@ -1,15 +1,21 @@
 import asyncio
+import math
+import multiprocessing
+import random
 import socket
 import subprocess
 import time
 from contextlib import contextmanager
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
-from cc_agent import load_dataset
+from cc_agent import flatten_messages, load_dataset
+from datasets import Dataset
 from rich.console import Console
+from transformers import AutoProcessor
 from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
 from utils.custom_callbacks import AddLogprobs
+from utils.trl_trainer import trl_training
 
 from agentlightning import configure_logger
 from agentlightning.adapter import LlmProxyTraceToTriplet
@@ -106,10 +112,12 @@ async def run_epoch(
     train_dataset: Any,
     llm_proxy: LLMProxy,
     data_adapter: LlmProxyTraceToTriplet,
-    triplet_fraction: float,
+    train_triplet_fraction: float,
 ) -> str:
     console.print(f"\n[bold red][Algo][/bold red] Starting epoch {epoch}")
 
+    tokenizer = AutoProcessor.from_pretrained(model_path)  # type: ignore
+    # 1. Rollout to get trace data
     with vllm_server(
         model_path, _find_available_port(), quantization=None, tool_call_parser="qwen3_coder", max_model_len=128 * 1024
     ) as server_address:
@@ -160,7 +168,10 @@ async def run_epoch(
             )
             await asyncio.sleep(5.0)
 
+    # 2. Prepare the dataset for training
+    all_triplets: List[Dict[str, Any]] = []
     for rollout in completed_rollouts:
+        # Use data_adapter to adapt the spans to triplets. Triplets are a list of Pydantic models:
         spans = await store.query_spans(rollout.rollout_id, "latest")
         triplets = data_adapter.adapt(spans)
 
@@ -173,11 +184,71 @@ async def run_epoch(
             f"Rewards are: {[t.reward for t in triplets]}"
         )
 
-    return f"{model_path}_{epoch+1}"
+        # Converts the triplets to a HuggingFace Dataset
+        # NOTE:
+        # - multiprocesses to speed up;
+        # - maybe customize reward for each triple in the future
+        recent_reward: Optional[float] = None
+        for triplet in reversed(triplets):
+            if triplet.reward is not None:
+                recent_reward = triplet.reward
+
+            if recent_reward is None:
+                console.print(
+                    f"[bold red][Algo][/bold red] Recent reward is None for triplet {triplet}. "
+                    "Skip adding to SFT training data."
+                )
+                continue
+
+            prompt = tokenizer.decode(triplet.prompt["token_ids"])  # type: ignore
+            all_triplets.append(
+                {
+                    "prompt_ids": triplet.prompt["token_ids"],
+                    "gold_completion_ids": triplet.response["token_ids"],
+                    "logprobs": triplet.response["logprobs"],
+                    "reward": recent_reward,
+                    "prompt": prompt,
+                    "messages": flatten_messages(triplet.metadata["messages"]),
+                }
+            )
+
+    if len(all_triplets) == 0:
+        raise ValueError("No triplets to train on.")
+
+    # NOTE:
+    # Here we do not handle data leakage where training samples are newer than eval set
+    random.shuffle(all_triplets)
+    split_point = math.ceil(len(all_triplets) * train_triplet_fraction)
+    train_triplets = all_triplets[:split_point]
+    if split_point > len(all_triplets):
+        eval_triplets = None
+    else:
+        eval_triplets = all_triplets[split_point:]
+
+    train_dataset = Dataset.from_list(train_triplets)  # type: ignore
+    eval_dataset = Dataset.from_list(eval_triplets) if eval_triplets is not None else None  # type: ignore
+    console.print(
+        f"[bold red][Algo][/bold red] Generated {len(all_triplets)} triplets for SFT training. "
+        f"Keeping {len(train_triplets)} for training."
+    )
+
+    # 3. Start the SFT training and save the model
+    next_model_path = f"models/version_{epoch + 1}"
+    context = multiprocessing.get_context("spawn")
+    trainer_process = context.Process(
+        target=trl_training, args=(model_path, train_dataset, eval_dataset, next_model_path), daemon=True
+    )
+    trainer_process.start()
+    trainer_process.join()
+
+    if trainer_process.is_alive():
+        console.print(f"[bold red][Algo][/bold red] Unsloth training process hung. Terminating...")
+
+    return next_model_path
 
 
 async def run_algorithm(store: LightningStore, model_path: str, num_epochs: int, train_triplet_fraction: float) -> None:
-    """An example SFT algorithm that communicates with rollout runners via the store.
+    """An example training algorithm that communicates with rollout runners via the store.
 
     Args:
         store: The LightningStoreClient instance.
@@ -196,7 +267,7 @@ async def run_algorithm(store: LightningStore, model_path: str, num_epochs: int,
             train_dataset=train_dataset,
             llm_proxy=llm_proxy,
             data_adapter=data_adapter,
-            triplet_fraction=train_triplet_fraction,
+            train_triplet_fraction=train_triplet_fraction,
         )
 
     console.print(f"[bold red][Algo][/bold red] Final model path: {model_path}")

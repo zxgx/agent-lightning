@@ -3,19 +3,21 @@ import json
 import os
 import platform
 import time
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 if platform.system() == "Linux":
     import resource
 
+from datasets import Dataset
 from swebench.harness.utils import load_swebench_dataset
+from transformers import AutoProcessor
 from utils.claude_code_controller import ClaudeController
 from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
 from utils.custom_callbacks import AddLogprobs
 from utils.evaluation import evaluate
 from utils.logger import logger
 
-from agentlightning import (  # LlmProxyTraceToTriplet,
+from agentlightning import (
     InMemoryLightningStore,
     LightningStoreServer,
     LitAgentRunner,
@@ -161,6 +163,27 @@ class CodingAgent(LitAgent):
         return proxy_llm.with_attempted_rollout(rollout)
 
 
+def flatten_messages(messages: List[Any]) -> List[Dict[str, str]]:
+    flattened: List[Dict[str, str]] = []
+    for msg in messages:
+        if msg["role"] in ["system", "user"] and isinstance(msg["content"], list):
+            msg_content: List[str] = []
+            for content in msg["content"]:
+                msg_content.append(content["text"])
+
+            msg["content"] = "".join(msg_content)
+        elif msg["role"] == "assistant" and "tool_calls" in msg:
+            # NOTE:
+            # Tool calls are list of dict, though in most case only one tool call is made per call
+            # We serialize it as json string here to avoid nested structure
+            msg["tool_calls"] = json.dumps(msg["tool_calls"])
+
+        for k in msg:
+            assert isinstance(msg[k], str), f"\n>>> {msg}"
+        flattened.append(msg)
+    return flattened
+
+
 async def cc_agent_dry_run_sample(model_path, server_address, dataset_path, sonnet_name, haiku_name) -> None:
     """Run a dry run of the cc agent on a single sample.
 
@@ -168,6 +191,8 @@ async def cc_agent_dry_run_sample(model_path, server_address, dataset_path, sonn
     using a single worker. Useful for testing the setup and configuration.
     """
     dataset = load_dataset(dataset_path, limit=4)
+    tokenizer = AutoProcessor.from_pretrained(model_path)
+
     logging = configure_logger(name="Claude Code Agent")
 
     tracer = OtelTracer()
@@ -216,6 +241,28 @@ async def cc_agent_dry_run_sample(model_path, server_address, dataset_path, sonn
             for span in spans:
                 f.write(json.dumps(span.model_dump()) + "\n")
         logging.info(f"dump {len(spans)} spans, extract {len(triplets)} triplets")
+
+        all_triplets: List[Dict[str, Any]] = []
+        recent_reward: Optional[float] = None
+        for triplet in reversed(triplets):
+            if triplet.reward is not None:
+                recent_reward = triplet.reward
+
+            prompt = tokenizer.decode(triplet.prompt["token_ids"])  # type: ignore
+            all_triplets.append(
+                {
+                    "prompt_ids": triplet.prompt["token_ids"],
+                    "gold_completion_ids": triplet.response["token_ids"],
+                    "logprobs": triplet.response["logprobs"],
+                    "reward": recent_reward,
+                    "prompt": prompt,
+                    "messages": flatten_messages(triplet.metadata["messages"]),
+                }
+            )
+
+        ds = Dataset.from_list(all_triplets)
+        ds.save_to_disk(f"dataset-{dataset[0]['instance_id']}")
+        logging.info(f"Saved dataset with {len(ds)} samples to dataset-{dataset[0]['instance_id']}")
 
 
 async def gold_cc_agent_run_dataset(
