@@ -1,5 +1,4 @@
 import asyncio
-import os
 import socket
 import subprocess
 import time
@@ -9,12 +8,14 @@ from typing import Any, List, Optional
 import httpx
 from cc_agent import load_dataset
 from rich.console import Console
+from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
+from utils.custom_callbacks import AddLogprobs
 
 from agentlightning import configure_logger
 from agentlightning.adapter import LlmProxyTraceToTriplet
 from agentlightning.llm_proxy import LLMProxy, ModelConfig
 from agentlightning.store import LightningStore, LightningStoreClient
-from agentlightning.types import Dataset, Rollout
+from agentlightning.types import Rollout
 
 console = Console()
 
@@ -131,7 +132,7 @@ async def run_epoch(
             ]
         )
 
-        llm_proxy.restart()
+        await llm_proxy.restart()
 
         resources_update = await store.add_resources({"llm": llm_proxy.as_resource(model="local")})
 
@@ -183,15 +184,9 @@ async def run_algorithm(store: LightningStore, model_path: str, num_epochs: int,
     """
 
     llm_proxy = LLMProxy(
-        port=_find_available_port(),
-        litellm_config={
-            "general_settings": {
-                "master_key": os.environ.get("ANTHROPIC_AUTH_TOKEN", "dummy"),
-            }
-        },
-        store=store,
+        port=_find_available_port(), store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs]
     )
-    data_adapter = LlmProxyTraceToTriplet()
+    data_adapter = LlmProxyTraceToAugmentedTriplet()
     for epoch in range(num_epochs):
         train_dataset = load_dataset(epoch=epoch, limit=2)
         model_path = await run_epoch(
