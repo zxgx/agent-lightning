@@ -18,6 +18,12 @@ from fastapi import Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+    ExportTraceServiceRequest as PbExportTraceServiceRequest,
+)
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+    ExportTraceServiceResponse as PbExportTraceServiceResponse,
+)
 from opentelemetry.sdk.trace import ReadableSpan
 from pydantic import BaseModel, Field, TypeAdapter
 
@@ -35,6 +41,7 @@ from agentlightning.types import (
     Worker,
     WorkerStatus,
 )
+from agentlightning.utils.otlp import handle_otlp_export, spans_from_proto
 from agentlightning.utils.server_launcher import LaunchMode, PythonServerLauncher, PythonServerLauncherArgs
 
 from .base import UNSET, LightningStore, LightningStoreCapabilities, Unset
@@ -284,6 +291,8 @@ class LightningStoreServer(LightningStore):
     and automatically delegate to an HTTP client instead of using the local store.
     This ensures one single copy of the store will be shared across all processes.
 
+    This server exporting OTLP-compatible traces via the `/v1/traces` endpoint.
+
     Args:
         store: The underlying store to delegate operations to.
         host: The hostname or IP address to bind the server to.
@@ -323,13 +332,13 @@ class LightningStoreServer(LightningStore):
             )
 
         store_capabilities = self.store.capabilities
-        if not store_capabilities["async_safe"]:
+        if not store_capabilities.get("async_safe", False):
             raise ValueError("The store is not async-safe. Please use another store for the server.")
-        if self.launcher_args.launch_mode == "mp" and not store_capabilities["zero_copy"]:
+        if self.launcher_args.launch_mode == "mp" and not store_capabilities.get("zero_copy", False):
             raise ValueError(
                 "The store does not support zero-copy. Please use another store, or use asyncio or thread mode to launch the server."
             )
-        if self.launcher_args.launch_mode == "thread" and not store_capabilities["thread_safe"]:
+        if self.launcher_args.launch_mode == "thread" and not store_capabilities.get("thread_safe", False):
             server_logger.warning(
                 "The store is not thread-safe. Please be careful when using the store server and the underlying store in different threads."
             )
@@ -362,7 +371,12 @@ class LightningStoreServer(LightningStore):
             async_safe=True,
             thread_safe=True,
             zero_copy=True,
+            otlp_traces=True,
         )
+
+    def otlp_traces_endpoint(self) -> str:
+        """Return the OTLP/HTTP traces endpoint of the store."""
+        return f"{self.endpoint}/v1/traces"
 
     def __getstate__(self):
         """
@@ -770,12 +784,33 @@ class LightningStoreServer(LightningStore):
         async def wait_for_rollouts(request: WaitForRolloutsRequest):  # pyright: ignore[reportUnusedFunction]
             return await self.wait_for_rollouts(rollout_ids=request.rollout_ids, timeout=request.timeout)
 
+        # Setup OTLP endpoints
+        self._setup_otlp(api)
+
+        # Mount the API router of /v1/...
+        self.app.include_router(api)
+
+        # Finally, mount the dashboard assets
+        self._setup_dashboard()
+
+    def _setup_otlp(self, api: APIRouter):
+        """Setup OTLP endpoints."""
+
+        async def _trace_handler(request: PbExportTraceServiceRequest) -> None:
+            spans = await spans_from_proto(request, self)
+            server_logger.debug(f"Received {len(spans)} OTLP spans: {', '.join([span.name for span in spans])}")
+            for span in spans:
+                await self.add_span(span)
+
         # Reserved methods for OTEL traces
         # https://opentelemetry.io/docs/specs/otlp/#otlphttp-request
         @api.post("/traces")
-        async def otlp_traces():  # pyright: ignore[reportUnusedFunction]
-            return Response(status_code=501)
+        async def otlp_traces(request: Request):  # pyright: ignore[reportUnusedFunction]
+            return await handle_otlp_export(
+                request, PbExportTraceServiceRequest, PbExportTraceServiceResponse, _trace_handler, "traces"
+            )
 
+        # Other API endpoints are not supported yet
         @api.post("/metrics")
         async def otlp_metrics():  # pyright: ignore[reportUnusedFunction]
             return Response(status_code=501)
@@ -787,12 +822,6 @@ class LightningStoreServer(LightningStore):
         @api.post("/development/profiles")
         async def otlp_development_profiles():  # pyright: ignore[reportUnusedFunction]
             return Response(status_code=501)
-
-        # Mount the API router of /v1/...
-        self.app.include_router(api)
-
-        # Finally, mount the dashboard assets
-        self._setup_dashboard()
 
     def _setup_dashboard(self):
         """Setup the dashboard static files and SPA."""
@@ -1032,7 +1061,8 @@ class LightningStoreClient(LightningStore):
         request_timeout: float = 30.0,
         connection_timeout: float = 5.0,
     ):
-        self.server_address = server_address.rstrip("/") + API_V1_AGL_PREFIX
+        self.server_address_root = server_address.rstrip("/")
+        self.server_address = self.server_address_root + API_V1_AGL_PREFIX
         self._sessions: Dict[int, aiohttp.ClientSession] = {}  # id(loop) -> ClientSession
         self._lock = threading.Lock()
 
@@ -1055,7 +1085,12 @@ class LightningStoreClient(LightningStore):
             thread_safe=True,
             async_safe=True,
             zero_copy=True,
+            otlp_traces=True,
         )
+
+    def otlp_traces_endpoint(self) -> str:
+        """Return the OTLP/HTTP traces endpoint of the store."""
+        return f"{self.server_address_root}/v1/traces"
 
     def __getstate__(self):
         """

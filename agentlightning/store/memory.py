@@ -293,6 +293,7 @@ class InMemoryLightningStore(LightningStore):
             thread_safe=False,
             async_safe=True,
             zero_copy=False,
+            otlp_traces=False,
         )
 
     @_healthcheck_wrapper
@@ -340,7 +341,7 @@ class InMemoryLightningStore(LightningStore):
             self._attempts[rollout.rollout_id] = [attempt]
             self._rollouts[rollout.rollout_id] = rollout
 
-            # Manully added rollout is not added to task queue. It's already preparing
+            # Manually added rollout is not added to task queue. It's already preparing
             self._completion_events.setdefault(rollout.rollout_id, threading.Event())
 
             return AttemptedRollout(**rollout.model_dump(), attempt=attempt)
