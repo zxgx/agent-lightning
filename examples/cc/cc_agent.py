@@ -184,7 +184,9 @@ def flatten_messages(messages: List[Any]) -> List[Dict[str, str]]:
     return flattened
 
 
-async def cc_agent_dry_run_sample(model_path, server_address, dataset_path, sonnet_name, haiku_name) -> None:
+async def cc_agent_dry_run_sample(
+    model_path, server_address, dataset_path, sonnet_name, haiku_name, max_step, output_dir
+) -> None:
     """Run a dry run of the cc agent on a single sample.
 
     This is a simple test function that runs the math agent on the first 4 problems
@@ -230,44 +232,49 @@ async def cc_agent_dry_run_sample(model_path, server_address, dataset_path, sonn
         }
     )
 
-    with runner.run_context(agent=CodingAgent(), store=store):
+    with runner.run_context(agent=CodingAgent(max_step=max_step), store=store):
         rollout = await runner.step(
             dataset[0],
         )
 
         spans = await store.query_spans(rollout.rollout_id)
         triplets = adapter.adapt(spans)
-        with open(f"stream_{dataset[0]['instance_id']}.json", "w") as f:
-            for span in spans:
-                f.write(json.dumps(span.model_dump()) + "\n")
         logging.info(f"dump {len(spans)} spans, extract {len(triplets)} triplets")
+        if output_dir is not None:
+            with open(os.path.join(output_dir, f"stream_{dataset[0]['instance_id']}.json"), "w") as f:
+                for span in spans:
+                    f.write(json.dumps(span.model_dump()) + "\n")
 
-        all_triplets: List[Dict[str, Any]] = []
-        recent_reward: Optional[float] = None
-        for triplet in reversed(triplets):
-            if triplet.reward is not None:
-                recent_reward = triplet.reward
+            all_triplets: List[Dict[str, Any]] = []
+            recent_reward: Optional[float] = None
+            for triplet in reversed(triplets):
+                if triplet.reward is not None:
+                    recent_reward = triplet.reward
 
-            prompt = tokenizer.decode(triplet.prompt["token_ids"])  # type: ignore
-            all_triplets.append(
-                {
-                    "prompt_ids": triplet.prompt["token_ids"],
-                    "gold_completion_ids": triplet.response["token_ids"],
-                    "logprobs": triplet.response["logprobs"],
-                    "reward": recent_reward,
-                    "prompt": prompt,
-                    "messages": flatten_messages(triplet.metadata["messages"]),
-                }
-            )
+                prompt = tokenizer.decode(triplet.prompt["token_ids"])  # type: ignore
+                all_triplets.append(
+                    {
+                        "repo": rollout.input["repo"],
+                        "instance_id": rollout.input["instance_id"],
+                        "turn": triplet.metadata["sequence_id"],
+                        "prompt_ids": triplet.prompt["token_ids"],
+                        "gold_completion_ids": triplet.response["token_ids"],
+                        "logprobs": triplet.response["logprobs"],
+                        "reward": recent_reward,
+                        "prompt": prompt,
+                        "messages": flatten_messages(triplet.metadata["messages"]),
+                    }
+                )
 
-        ds = Dataset.from_list(all_triplets)
-        ds.save_to_disk(f"dataset-{dataset[0]['instance_id']}")
-        logging.info(f"Saved dataset with {len(ds)} samples to dataset-{dataset[0]['instance_id']}")
+            ds = Dataset.from_list(all_triplets)
+            ds.save_to_disk(os.path.join(output_dir, f"dataset-{dataset[0]['instance_id']}"))
+            logging.info(f"Saved dataset with {len(ds)} samples to dataset-{dataset[0]['instance_id']}")
 
 
 async def gold_cc_agent_run_dataset(
     sonnet_name,
     haiku_name,
+    max_step,
     dataset_path,
     output_dir,
 ):
@@ -277,8 +284,6 @@ async def gold_cc_agent_run_dataset(
     using a single worker. Useful for testing the setup and configuration.
     """
     dataset = load_dataset(dataset_path)
-    if output_dir is not None:
-        os.makedirs(output_dir, exist_ok=True)
 
     logging = configure_logger(name="Claude Code Agent")
 
@@ -311,14 +316,17 @@ async def gold_cc_agent_run_dataset(
     )
 
     for each in dataset:
-        with runner.run_context(agent=CodingAgent(), store=store):
+        with runner.run_context(agent=CodingAgent(max_step=max_step), store=store):
             rollout = await runner.step(each)
             spans = await store.query_spans(rollout.rollout_id)
 
-        logging.info(f"instance {each['instance_id']} dump {len(spans)} spans to {output_dir}")
-        with open(os.path.join(output_dir, f"{each['instance_id']}.json"), "w") as f:
-            for span in spans:
-                f.write(json.dumps(span.model_dump()) + "\n")
+        if output_dir is None:
+            logging.info(f"instance {each['instance_id']} generate {len(spans)} spans")
+        else:
+            logging.info(f"instance {each['instance_id']} dump {len(spans)} spans to {output_dir}")
+            with open(os.path.join(output_dir, f"{each['instance_id']}.json"), "w") as f:
+                for span in spans:
+                    f.write(json.dumps(span.model_dump()) + "\n")
 
         time.sleep(2 * 60)
 
@@ -327,24 +335,39 @@ if __name__ == "__main__":
     from argparse import ArgumentParser
 
     parser = ArgumentParser()
+    # extract spans from official Claude Code
     parser.add_argument("--official", action="store_true", help="Whether to run official claude code.")
+
+    # extract spans from hosted LLM server via litellm proxy
+    parser.add_argument(
+        "--model_name_or_path", type=str, default="Qwen/Qwen3-Coder-30B-A3B-Instruct", help="Model name or path."
+    )
+    parser.add_argument("--server_address", type=str, default="http://localhost:8000/v1", help="LLM server address.")
+
+    # common setup
     parser.add_argument(
         "--sonnet_name", type=str, default="claude-sonnet-4-5-20250929", help="Name of the sonnet model."
     )
     parser.add_argument("--haiku_name", type=str, default="claude-haiku-4-5-20251001", help="Name of the haiku model.")
     parser.add_argument("--dataset_path", type=str, default="swe_debug.jsonl", help="Path to the dataset.")
-    parser.add_argument("--output_dir", type=str, default="gold_logs", help="Directory to save output logs.")
+    parser.add_argument("--max_step", type=int, default=5, help="Maximum steps per instance.")
+    parser.add_argument("--output_dir", type=str, default="data", help="Directory to save output logs.")
 
     args = parser.parse_args()
+
+    if args.output_dir is not None:
+        os.makedirs(args.output_dir, exist_ok=True)
 
     if not args.official:
         asyncio.run(
             cc_agent_dry_run_sample(
-                model_path="Qwen/Qwen3-Coder-30B-A3B-Instruct",
-                server_address="http://localhost:8000/v1",
+                model_path=args.model_name_or_path,
+                server_address=args.server_address,
                 dataset_path=args.dataset_path,
                 sonnet_name=args.sonnet_name,
                 haiku_name=args.haiku_name,
+                max_step=args.max_step,
+                output_dir=args.output_dir,
             )
         )
     else:
@@ -354,5 +377,6 @@ if __name__ == "__main__":
                 haiku_name=args.haiku_name,
                 dataset_path=args.dataset_path,
                 output_dir=args.output_dir,
+                max_step=args.max_step,
             )
         )

@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from cc_agent import flatten_messages, load_dataset
-from datasets import Dataset
+from datasets import Dataset, DatasetDict
 from rich.console import Console
 from transformers import AutoProcessor
 from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
@@ -105,6 +105,30 @@ def vllm_server(
             proc.kill()
 
 
+def run_trainer(config_path: str, model_path: str, dataset_path: str, output_dir: str) -> None:
+    # Launch the training script via accelerate
+    cmd = ["accelerate", "launch", "--config_file", config_path, "offline_rloo.py"]
+
+    # script arguments
+    cmd += [
+        "--model_name_or_path",
+        model_path,
+        "--dataset_dir",
+        dataset_path,
+        "--output_dir",
+        output_dir,
+    ]
+
+    console.print(f"[bold red][Algo][/bold red] {' '.join(cmd)}")
+
+    result = subprocess.run(cmd, check=False, text=True)
+
+    exit_code = result.returncode
+
+    if exit_code != 0:
+        raise RuntimeError(f"Training process exited with code {exit_code}")
+
+
 async def run_epoch(
     epoch: int,
     store: LightningStore,
@@ -113,6 +137,8 @@ async def run_epoch(
     llm_proxy: LLMProxy,
     data_adapter: LlmProxyTraceToTriplet,
     train_triplet_fraction: float,
+    dataset_dump_path: str,
+    config_path: str,
 ) -> str:
     console.print(f"\n[bold red][Algo][/bold red] Starting epoch {epoch}")
 
@@ -203,6 +229,9 @@ async def run_epoch(
             prompt = tokenizer.decode(triplet.prompt["token_ids"])  # type: ignore
             all_triplets.append(
                 {
+                    "repo": rollout.input["repo"],
+                    "instance_id": rollout.input["instance_id"],
+                    "turn": triplet.metadata["sequence_id"],
                     "prompt_ids": triplet.prompt["token_ids"],
                     "gold_completion_ids": triplet.response["token_ids"],
                     "logprobs": triplet.response["logprobs"],
@@ -219,11 +248,9 @@ async def run_epoch(
     # Here we do not handle data leakage where training samples are newer than eval set
     random.shuffle(all_triplets)
     split_point = math.ceil(len(all_triplets) * train_triplet_fraction)
+    assert split_point < len(all_triplets) - 1
     train_triplets = all_triplets[:split_point]
-    if split_point > len(all_triplets):
-        eval_triplets = None
-    else:
-        eval_triplets = all_triplets[split_point:]
+    eval_triplets = all_triplets[split_point:]
 
     train_dataset = Dataset.from_list(train_triplets)  # type: ignore
     eval_dataset = Dataset.from_list(eval_triplets) if eval_triplets is not None else None  # type: ignore
@@ -232,22 +259,27 @@ async def run_epoch(
         f"Keeping {len(train_triplets)} for training."
     )
 
+    combined_dataset = DatasetDict({"train": train_dataset, "test": eval_dataset})
+    dataset_path = f"{dataset_dump_path}/epoch_{epoch}"
+    combined_dataset.save_to_disk(f"{dataset_dump_path}/epoch_{epoch}")
+
+    del all_triplets, train_triplets, eval_triplets, train_dataset, eval_dataset, combined_dataset
+
     # 3. Start the SFT training and save the model
     next_model_path = f"models/version_{epoch + 1}"
-    context = multiprocessing.get_context("spawn")
-    trainer_process = context.Process(
-        target=trl_training, args=(model_path, train_dataset, eval_dataset, next_model_path), daemon=True
-    )
-    trainer_process.start()
-    trainer_process.join()
-
-    if trainer_process.is_alive():
-        console.print(f"[bold red][Algo][/bold red] Unsloth training process hung. Terminating...")
-
+    run_trainer(config_path, model_path, dataset_path, next_model_path)
     return next_model_path
 
 
-async def run_algorithm(store: LightningStore, model_path: str, num_epochs: int, train_triplet_fraction: float) -> None:
+async def run_algorithm(
+    store: LightningStore,
+    model_path: str,
+    num_epochs: int,
+    train_triplet_fraction: float,
+    dataset_path: str,
+    dataset_dump_path: str,
+    config_path: str,
+) -> None:
     """An example training algorithm that communicates with rollout runners via the store.
 
     Args:
@@ -259,7 +291,7 @@ async def run_algorithm(store: LightningStore, model_path: str, num_epochs: int,
     )
     data_adapter = LlmProxyTraceToAugmentedTriplet()
     for epoch in range(num_epochs):
-        train_dataset = load_dataset(epoch=epoch, limit=2)
+        train_dataset = load_dataset(dataset_path, epoch=epoch)
         model_path = await run_epoch(
             epoch=epoch,
             store=store,
@@ -268,6 +300,8 @@ async def run_algorithm(store: LightningStore, model_path: str, num_epochs: int,
             llm_proxy=llm_proxy,
             data_adapter=data_adapter,
             train_triplet_fraction=train_triplet_fraction,
+            dataset_dump_path=dataset_dump_path,
+            config_path=config_path,
         )
 
     console.print(f"[bold red][Algo][/bold red] Final model path: {model_path}")
@@ -293,6 +327,11 @@ if __name__ == "__main__":
         type=float,
         default=0.8,
     )
+    parser.add_argument("--dataset_path", type=str, default="swe_debug.jsonl")
+    parser.add_argument(
+        "--dataset_dump_path", type=str, default="datasets", help="If not None, dump the dataset to disk."
+    )
+    parser.add_argument("--config_path", type=str, default="accelerate_config.yaml")
     args = parser.parse_args()
 
     store = LightningStoreClient(args.store_address)
@@ -303,5 +342,8 @@ if __name__ == "__main__":
             model_path=args.model_name_or_path,
             num_epochs=args.num_epochs,
             train_triplet_fraction=args.train_triplet_fraction,
+            dataset_path=args.dataset_path,
+            dataset_dump_path=args.dataset_dump_path,
+            config_path=args.config_path,
         )
     )
