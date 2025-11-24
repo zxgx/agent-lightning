@@ -300,7 +300,10 @@ if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
             ).replace('"', r"\"")
             ps1 = CMD_OUTPUT_PS1_BEGIN + json_str + CMD_OUTPUT_PS1_END + "\n"
             self.send_command(f'export PROMPT_COMMAND=\'export PS1="{ps1}"\'; export PS2=""')
+            time.sleep(1)
             self.send_command("apt update && apt install -y git")
+            time.sleep(1)
+            self.send_command("sleep 1")
         self.stopped = False
 
     def _stream_output(self):

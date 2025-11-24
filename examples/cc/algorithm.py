@@ -36,13 +36,9 @@ def _find_available_port() -> int:
 def vllm_server(
     model_path: str,
     port: int,
+    vllm_serve_args_str: str,
     startup_timeout: float = 300.0,
     terminate_timeout: float = 10.0,
-    max_model_len: int = 32768,
-    gpu_memory_utilization: float = 0.7,
-    quantization: Optional[str] = "bitsandbytes",
-    auto_tool_choice: bool = True,
-    tool_call_parser: Optional[str] = "hermes",
 ):
     """Serves a vLLM model from command line.
 
@@ -60,19 +56,11 @@ def vllm_server(
     proc: Optional[subprocess.Popen[bytes]] = None
     try:
         vllm_serve_args = [
-            "--max-model-len",
-            str(max_model_len),
             "--port",
             str(port),
         ]
-        if quantization is not None:
-            vllm_serve_args.append("--quantization")
-            vllm_serve_args.append(quantization)
-        if auto_tool_choice:
-            vllm_serve_args.append("--enable-auto-tool-choice")
-        if tool_call_parser is not None:
-            vllm_serve_args.append("--tool-call-parser")
-            vllm_serve_args.append(tool_call_parser)
+        if vllm_serve_args_str:
+            vllm_serve_args.extend(vllm_serve_args_str.strip().split())
 
         proc = subprocess.Popen(["vllm", "serve", model_path, *vllm_serve_args])
 
@@ -133,6 +121,7 @@ async def run_epoch(
     epoch: int,
     store: LightningStore,
     model_path: str,
+    vllm_serve_args_str: str,
     train_dataset: Any,
     llm_proxy: LLMProxy,
     data_adapter: LlmProxyTraceToTriplet,
@@ -145,7 +134,7 @@ async def run_epoch(
     tokenizer = AutoProcessor.from_pretrained(model_path)  # type: ignore
     # 1. Rollout to get trace data
     with vllm_server(
-        model_path, _find_available_port(), quantization=None, tool_call_parser="qwen3_coder", max_model_len=128 * 1024
+        model_path, _find_available_port(), vllm_serve_args_str
     ) as server_address:
         llm_proxy.update_model_list(
             [
@@ -273,7 +262,9 @@ async def run_epoch(
 
 async def run_algorithm(
     store: LightningStore,
+    proxy_port: int,
     model_path: str,
+    vllm_serve_args_str: str,
     num_epochs: int,
     train_triplet_fraction: float,
     dataset_path: str,
@@ -287,7 +278,7 @@ async def run_algorithm(
     """
 
     llm_proxy = LLMProxy(
-        port=_find_available_port(), store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs]
+        port=proxy_port, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs]
     )
     data_adapter = LlmProxyTraceToAugmentedTriplet()
     for epoch in range(num_epochs):
@@ -296,6 +287,7 @@ async def run_algorithm(
             epoch=epoch,
             store=store,
             model_path=model_path,
+            vllm_serve_args_str=vllm_serve_args_str,
             train_dataset=train_dataset,
             llm_proxy=llm_proxy,
             data_adapter=data_adapter,
@@ -321,6 +313,8 @@ if __name__ == "__main__":
         default="Qwen/Qwen3-Coder-30B-A3B-Instruct",
         help="The model name or path for the LLM backend.",
     )
+    parser.add_argument("--vllm_serve_args_str", type=str, default="--enable-auto-tool-choice --tool-call-parser qwen3_coder", help="The additional arguments for vLLM serve.")
+    parser.add_argument("--proxy_port", type=int, default=8765, help="The port for the LLM proxy server.")
     parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs.")
     parser.add_argument(
         "--train_triplet_fraction",
@@ -339,7 +333,9 @@ if __name__ == "__main__":
     asyncio.run(
         run_algorithm(
             store=store,
+            proxy_port=args.proxy_port,
             model_path=args.model_name_or_path,
+            vllm_serve_args_str=args.vllm_serve_args_str,
             num_epochs=args.num_epochs,
             train_triplet_fraction=args.train_triplet_fraction,
             dataset_path=args.dataset_path,
