@@ -189,7 +189,7 @@ def main():
         return rewards
 
     # Training
-    peft_config = LoraConfig()
+    peft_config = LoraConfig(target_modules="all-linear")
     # prompt_tuning_init_text = "Help the user to fix bugs in this repo.\n"
     # peft_config = PromptEncoderConfig(
     #     task_type="CAUSAL_LM",
