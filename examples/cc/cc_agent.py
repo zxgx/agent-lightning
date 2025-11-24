@@ -10,11 +10,11 @@ if platform.system() == "Linux":
 
 from datasets import Dataset
 from swebench.harness.utils import load_swebench_dataset
+from swebench_utils.evaluation import evaluate
 from transformers import AutoProcessor
 from utils.claude_code_controller import ClaudeController
 from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
 from utils.custom_callbacks import AddLogprobs
-from utils.evaluation import evaluate
 from utils.logger import logger
 
 from agentlightning import (

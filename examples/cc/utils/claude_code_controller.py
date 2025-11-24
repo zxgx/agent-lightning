@@ -1,9 +1,8 @@
-import os
 from functools import partial
 from typing import Literal
 
 import dotenv
-from utils.docker_runtime import Runtime
+from swebench_utils.docker_runtime import Runtime
 from utils.logger import logger
 
 
