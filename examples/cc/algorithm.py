@@ -1,6 +1,5 @@
 import asyncio
 import math
-import multiprocessing
 import random
 import socket
 import subprocess
@@ -15,7 +14,6 @@ from rich.console import Console
 from transformers import AutoProcessor
 from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
 from utils.custom_callbacks import AddLogprobs
-from utils.trl_trainer import trl_training
 
 from agentlightning import configure_logger
 from agentlightning.adapter import LlmProxyTraceToTriplet
@@ -133,9 +131,7 @@ async def run_epoch(
 
     tokenizer = AutoProcessor.from_pretrained(model_path)  # type: ignore
     # 1. Rollout to get trace data
-    with vllm_server(
-        model_path, _find_available_port(), vllm_serve_args_str
-    ) as server_address:
+    with vllm_server(model_path, _find_available_port(), vllm_serve_args_str) as server_address:
         llm_proxy.update_model_list(
             [
                 ModelConfig(
@@ -263,6 +259,7 @@ async def run_epoch(
 async def run_algorithm(
     store: LightningStore,
     proxy_port: int,
+    access_host: Optional[str],
     model_path: str,
     vllm_serve_args_str: str,
     num_epochs: int,
@@ -277,9 +274,10 @@ async def run_algorithm(
         store: The LightningStoreClient instance.
     """
 
-    llm_proxy = LLMProxy(
-        port=proxy_port, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs]
-    )
+    llm_proxy = LLMProxy(port=proxy_port, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs])
+    if access_host is not None:
+        llm_proxy.server_launcher.args.access_host = access_host
+
     data_adapter = LlmProxyTraceToAugmentedTriplet()
     for epoch in range(num_epochs):
         train_dataset = load_dataset(dataset_path, epoch=epoch)
@@ -307,13 +305,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--store_address", type=str, default="http://localhost:4747", help="The address of the LightningStore server."
     )
+    parser.add_argument("--access_host", type=str, default=None, help="The access host for the LLM proxy server.")
     parser.add_argument(
         "--model_name_or_path",
         type=str,
         default="Qwen/Qwen3-Coder-30B-A3B-Instruct",
         help="The model name or path for the LLM backend.",
     )
-    parser.add_argument("--vllm_serve_args_str", type=str, default="--enable-auto-tool-choice --tool-call-parser qwen3_coder", help="The additional arguments for vLLM serve.")
+    parser.add_argument(
+        "--vllm_serve_args_str",
+        type=str,
+        default="--enable-auto-tool-choice --tool-call-parser qwen3_coder",
+        help="The additional arguments for vLLM serve.",
+    )
     parser.add_argument("--proxy_port", type=int, default=8765, help="The port for the LLM proxy server.")
     parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs.")
     parser.add_argument(
@@ -334,6 +338,7 @@ if __name__ == "__main__":
         run_algorithm(
             store=store,
             proxy_port=args.proxy_port,
+            access_host=args.access_host,
             model_path=args.model_name_or_path,
             vllm_serve_args_str=args.vllm_serve_args_str,
             num_epochs=args.num_epochs,
