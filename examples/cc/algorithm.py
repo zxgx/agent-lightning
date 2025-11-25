@@ -1,5 +1,7 @@
 import asyncio
+import json
 import math
+import os
 import random
 import socket
 import subprocess
@@ -11,7 +13,7 @@ import httpx
 from cc_agent import flatten_messages, load_dataset
 from datasets import Dataset, DatasetDict
 from rich.console import Console
-from transformers import AutoProcessor
+from transformers import AutoTokenizer
 from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
 from utils.custom_callbacks import AddLogprobs
 
@@ -91,46 +93,10 @@ def vllm_server(
             proc.kill()
 
 
-def run_trainer(config_path: str, model_path: str, dataset_path: str, output_dir: str) -> None:
-    # Launch the training script via accelerate
-    cmd = ["accelerate", "launch", "--config_file", config_path, "offline_rloo.py"]
-
-    # script arguments
-    cmd += [
-        "--model_name_or_path",
-        model_path,
-        "--dataset_dir",
-        dataset_path,
-        "--output_dir",
-        output_dir,
-    ]
-
-    console.print(f"[bold red][Algo][/bold red] {' '.join(cmd)}")
-
-    result = subprocess.run(cmd, check=False, text=True)
-
-    exit_code = result.returncode
-
-    if exit_code != 0:
-        raise RuntimeError(f"Training process exited with code {exit_code}")
-
-
-async def run_epoch(
-    epoch: int,
-    store: LightningStore,
-    model_path: str,
-    vllm_serve_args_str: str,
-    train_dataset: Any,
-    llm_proxy: LLMProxy,
-    data_adapter: LlmProxyTraceToTriplet,
-    train_triplet_fraction: float,
-    dataset_dump_path: str,
-    config_path: str,
-) -> str:
-    console.print(f"\n[bold red][Algo][/bold red] Starting epoch {epoch}")
-
-    tokenizer = AutoProcessor.from_pretrained(model_path)  # type: ignore
-    # 1. Rollout to get trace data
+async def run_rollout(
+    model_path: str, vllm_serve_args_str: str, llm_proxy: LLMProxy, store: LightningStore, task_dataset: Any
+) -> List[Rollout]:
+    """Rollout to get trace data"""
     with vllm_server(model_path, _find_available_port(), vllm_serve_args_str) as server_address:
         llm_proxy.update_model_list(
             [
@@ -156,7 +122,7 @@ async def run_epoch(
         resources_update = await store.add_resources({"llm": llm_proxy.as_resource(model="local")})
 
         rollouts: List[Rollout] = []
-        for data in train_dataset:
+        for data in task_dataset:
             rollouts.append(
                 await store.enqueue_rollout(input=data, mode="train", resources_id=resources_update.resources_id)
             )
@@ -179,8 +145,27 @@ async def run_epoch(
             )
             await asyncio.sleep(5.0)
 
-    # 2. Prepare the dataset for training
+        return completed_rollouts
+
+
+async def build_dataset(
+    completed_rollouts: List[Rollout],
+    store: LightningStore,
+    data_adapter: LlmProxyTraceToTriplet,
+    tokenizer: AutoTokenizer,
+    epoch: int,
+    train_triplet_fraction: float,
+    dataset_dump_path: str,
+    span_dump_path: Optional[str] = None,
+) -> str:
+    """Prepare the dataset for training"""
     all_triplets: List[Dict[str, Any]] = []
+
+    spand_dump_epoch_path = None
+    if span_dump_path:
+        spand_dump_epoch_path = os.path.join(span_dump_path, f"epoch_{epoch}")
+        os.makedirs(spand_dump_epoch_path, exist_ok=True)
+
     for rollout in completed_rollouts:
         # Use data_adapter to adapt the spans to triplets. Triplets are a list of Pydantic models:
         spans = await store.query_spans(rollout.rollout_id, "latest")
@@ -226,6 +211,12 @@ async def run_epoch(
                 }
             )
 
+        if spand_dump_epoch_path:
+            span_file_path = os.path.join(spand_dump_epoch_path, f"{rollout.input['instance_id']}.json")
+            with open(span_file_path, "w") as f:
+                for span in spans:
+                    f.write(json.dumps(span.model_dump()) + "\n")
+
     if len(all_triplets) == 0:
         raise ValueError("No triplets to train on.")
 
@@ -244,14 +235,76 @@ async def run_epoch(
         f"Keeping {len(train_triplets)} for training."
     )
 
-    combined_dataset = DatasetDict({"train": train_dataset, "test": eval_dataset})
-    dataset_path = f"{dataset_dump_path}/epoch_{epoch}"
-    combined_dataset.save_to_disk(f"{dataset_dump_path}/epoch_{epoch}")
+    dataset_path = os.path.join(dataset_dump_path, f"epoch_{epoch}")
+    DatasetDict({"train": train_dataset, "test": eval_dataset}).save_to_disk(  # type: ignore
+        dataset_path
+    )  # type: ignore
+    return dataset_path
 
-    del all_triplets, train_triplets, eval_triplets, train_dataset, eval_dataset, combined_dataset
 
-    # 3. Start the SFT training and save the model
-    next_model_path = f"models/version_{epoch + 1}"
+def run_trainer(config_path: str, model_path: str, dataset_path: str, output_dir: str) -> None:
+    """Start training and save the model"""
+    # Launch the training script via accelerate
+    cmd = ["accelerate", "launch", "--config_file", config_path, "offline_rloo.py"]
+
+    # script arguments
+    cmd += [
+        "--model_name_or_path",
+        model_path,
+        "--dataset_dir",
+        dataset_path,
+        "--output_dir",
+        output_dir,
+    ]
+
+    console.print(f"[bold red][Algo][/bold red] {' '.join(cmd)}")
+
+    result = subprocess.run(cmd, check=False, text=True)
+
+    exit_code = result.returncode
+
+    if exit_code != 0:
+        raise RuntimeError(f"Training process exited with code {exit_code}")
+
+
+async def run_epoch(
+    epoch: int,
+    store: LightningStore,
+    model_path: str,
+    tokenizer: AutoTokenizer,
+    vllm_serve_args_str: str,
+    task_dataset: Any,
+    llm_proxy: LLMProxy,
+    data_adapter: LlmProxyTraceToTriplet,
+    train_triplet_fraction: float,
+    dataset_dump_path: str,
+    config_path: str,
+    model_output_dir: str = "models",
+) -> str:
+    console.print(f"\n[bold red][Algo][/bold red] Starting epoch {epoch}")
+
+    # 1. Run rollout to get traces
+    completed_rollouts = await run_rollout(
+        model_path=model_path,
+        vllm_serve_args_str=vllm_serve_args_str,
+        llm_proxy=llm_proxy,
+        store=store,
+        task_dataset=task_dataset,
+    )
+
+    # 2. Build dataset from the traces
+    dataset_path = await build_dataset(
+        completed_rollouts=completed_rollouts,
+        store=store,
+        data_adapter=data_adapter,
+        tokenizer=tokenizer,
+        epoch=epoch,
+        train_triplet_fraction=train_triplet_fraction,
+        dataset_dump_path=dataset_dump_path,
+    )
+
+    # 3. Run trainer to train the model
+    next_model_path = os.path.join(model_output_dir, f"version_{epoch+1}")
     run_trainer(config_path, model_path, dataset_path, next_model_path)
     return next_model_path
 
@@ -278,15 +331,19 @@ async def run_algorithm(
     if access_host is not None:
         llm_proxy.server_launcher.args.access_host = access_host
 
+    tokenizer = AutoTokenizer.from_pretrained(model_path)  # type: ignore
+
     data_adapter = LlmProxyTraceToAugmentedTriplet()
+
     for epoch in range(num_epochs):
-        train_dataset = load_dataset(dataset_path, epoch=epoch)
+        task_dataset = load_dataset(dataset_path, epoch=epoch)
         model_path = await run_epoch(
             epoch=epoch,
             store=store,
             model_path=model_path,
+            tokenizer=tokenizer,  # type: ignore
             vllm_serve_args_str=vllm_serve_args_str,
-            train_dataset=train_dataset,
+            task_dataset=task_dataset,
             llm_proxy=llm_proxy,
             data_adapter=data_adapter,
             train_triplet_fraction=train_triplet_fraction,
