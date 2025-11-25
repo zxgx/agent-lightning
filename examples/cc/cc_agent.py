@@ -1,3 +1,17 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Main module for the Claude Code Agent implementation.
+
+This module provides the core functionality for running Claude Code agent experiments
+on SWE-bench datasets. It includes the CodingAgent class that implements the agent logic,
+functions for loading datasets, and asynchronous execution functions for running experiments.
+
+Key components:
+- CodingAgent: Main agent implementation that handles rollout logic
+- Dataset loading utilities
+- Asynchronous execution functions for dry runs and full datasets
+"""
+
 import asyncio
 import json
 import os

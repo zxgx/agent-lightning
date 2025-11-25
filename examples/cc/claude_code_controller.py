@@ -1,3 +1,18 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Controller module for managing Claude Code executions in containerized environments.
+
+This module provides the ClaudeController class that manages the execution of Claude Code
+within Docker containers. It handles container initialization, command execution, and
+patch application for SWE-bench evaluation tasks.
+
+Key features:
+- Container lifecycle management
+- Claude Code execution via CLI or Python SDK
+- Patch application and result retrieval
+- Integration with SWE-bench evaluation framework
+"""
+
 from functools import partial
 from typing import Literal
 

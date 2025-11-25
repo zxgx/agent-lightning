@@ -1,5 +1,7 @@
-"""
-Docker runtime management for repository setup and command execution.
+# Copyright (c) Microsoft. All rights reserved.
+
+
+"""Docker runtime management for repository setup and command execution.
 
 Provides containerized environment for repository testing with command execution,
 file operations, and state management capabilities.

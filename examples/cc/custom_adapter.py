@@ -1,3 +1,19 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Custom adapter module for converting LLM proxy traces to augmented trajectories.
+
+This module provides the LlmProxyTraceToAugmentedTriplet adapter that converts
+LLM proxy spans into augmented trajectories for analysis and evaluation. It extends
+the base LlmProxyTraceToTriplet to include additional metadata like chat messages,
+log probabilities, and sequence IDs.
+
+Key features:
+- Conversion of LLM proxy spans to triplet format
+- Augmentation with chat messages history
+- Log probability extraction
+- Sequence ID tracking for conversation turns
+"""
+
 import logging
 from typing import Any, Dict, List, Optional, Tuple, cast
 

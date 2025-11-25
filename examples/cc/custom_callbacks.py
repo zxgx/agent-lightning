@@ -1,3 +1,17 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Custom callback module for LiteLLM logging integration.
+
+This module provides the AddLogprobs callback that integrates with LiteLLM to
+request log probabilities from vLLM backends. It modifies outgoing request payloads
+to include logprobs=1 for backends that support log probability returns.
+
+Key features:
+- LiteLLM pre-call hook implementation
+- Log probability request augmentation
+- Backend compatibility for vLLM and similar systems
+"""
+
 from typing import Any, Dict, Optional, Union
 
 from litellm.integrations.custom_logger import CustomLogger

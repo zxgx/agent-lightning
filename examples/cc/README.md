@@ -1,12 +1,28 @@
 # Training ANY LLM to Claude Code
 
 This example wraps Claude Code as the agent to:
-1. collect traces from agent execution;
+1. collect traces from agent execution on coding tasks;
 2. train a hosted LLM with the traces ***🔨 Under development***
 
 ## Requirements
 1. install [agentlightning](https://microsoft.github.io/agent-lightning/stable/tutorials/installation/)
 2. `(uv) pip install swebench` for evaluation
+
+## Dataset
+We provide a small dataset `swe_debug.jsonl` which is a subset of [SWE-bench](https://huggingface.co/datasets/SWE-bench/SWE-bench) for sanity check.
+
+## Included Files
+
+| Filename                        | Description |
+|--------------------------------|-------------|
+| `cc_agent.py`                   | Main entry point for running Claude Code agent on coding tasks with trace collection capabilities |
+| `claude_code_controller.py`     | Controller implementation for managing Claude Code agent interactions and execution |
+| `custom_adapter.py`             | Custom adapter for integrating with Claude Code's interface and communication protocols |
+| `custom_callbacks.py`           | Callback handlers for customizing agent behavior and responses during execution |
+| `handle_hook.template.sh`       | Template script for handling hooks during agent execution |
+| `settings.template.json`        | Template configuration file with default settings for Claude Code agent |
+| `swe_debug.jsonl`               | Debug dataset containing a subset of SWE-bench samples for testing and verification |
+| `swebench_utils/`               | Utility module with helper functions for SWE-bench dataset containerized exeuction and evaluation |
 
 ## Trace collection
 We support running Claude Code via two ways:
@@ -34,10 +50,8 @@ python cc_agent \
     --max_step 32 \
     --output_dir data_debug
 ```
-We provide a small dataset `swe_debug.jsonl` which is a subset of [SWE-bench](https://huggingface.co/datasets/SWE-bench/SWE-bench) for sanity check.
-
 The above commands will generate a `data_debug` dir, which contains two targets: (1) a Huggingface Dataset named `dataset-<instance_id>` and (2) a trace file named `stream_<instance_id>.jsonl`, where `instance_id` is a unique key of the SWE-bench samples.
-The dataset showcases the versatile customization capability of agent-lightning. In particular, we support extracting prompt/response ids, logprobs from the vllm server.
+The dataset showcases the versatile customization capability of agent-lightning. In particular, we support extracting **prompt/response ids**, **logprobs** from the vllm server.
 The trace file is the conversation logs for claude code to tackle the SWE-bench instance.
 
 In addition, there will be a `logs` dir, which is the output of the docker container executing agent calls.
