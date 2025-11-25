@@ -7,17 +7,13 @@ file operations, and state management capabilities.
 
 from __future__ import annotations
 
-import io
 import json
-import os
 import queue
 import re
-import tarfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable, Optional
 
 from docker.models.containers import Container
@@ -48,14 +44,6 @@ VAR_PATTERNS = {
 }
 
 
-class RegWrapper:
-    def __init__(self, reg: str):
-        self.reg = reg
-
-    def group(self, idx=0):
-        return self.reg
-
-
 @dataclass
 class CmdOutputMetadata:
     """
@@ -70,31 +58,6 @@ class CmdOutputMetadata:
     hostname: str | None = None
     working_dir: str | None = None
     py_interpreter_path: str | None = None
-
-    @classmethod
-    def to_ps1_prompt(cls) -> str:
-        """
-        Convert metadata requirements into a PS1 prompt string.
-
-        Returns:
-            str: PS1 prompt configuration for capturing metadata
-        """
-        prompt = CMD_OUTPUT_PS1_BEGIN
-        json_str = json.dumps(
-            {
-                "exit_code": "$?",
-                "username": r"\u",
-                "hostname": r"\h",
-                "working_dir": r"$(pwd)",
-                "py_interpreter_path": r'$(which python 2>/dev/null || echo "")',
-            },
-            indent=2,
-        )
-        # Make sure we escape double quotes in the JSON string
-        # So that PS1 will keep them as part of the output
-        prompt += json_str.replace('"', r"\"")
-        prompt += CMD_OUTPUT_PS1_END + "\n"  # Ensure there's a newline at the end
-        return prompt
 
     @classmethod
     def matches_ps1_metadata(cls, output: str) -> list[re.Match[str]]:
@@ -195,7 +158,7 @@ class Runtime:
     file operations, and container lifecycle management.
     """
 
-    def __init__(self, container: Container, container_platform: str, log_function: Callable):
+    def __init__(self, container: Container, log_function: Callable):
         """
         Initialize runtime with an existing Docker container.
 
@@ -203,105 +166,25 @@ class Runtime:
             container (Container): Docker container instance to manage
         """
         self.container = container
-        self.platform = container_platform
         self.logger = log_function  # Set logger early so it's available even if init fails later
         self.sock = self.container.attach_socket(params={"stdin": 1, "stdout": 1, "stderr": 1, "stream": 1})
         self.output_queue = queue.Queue()
         self._start_output_thread()
         self._clear_initial_prompt()
-        if self.platform == "windows":
-            self.send_command(
-                r"""
-function prompt {
-  try { $ec = $global:LASTEXITCODE } catch { $ec = $null }
-  $ok = $ExecutionContext.SessionState.PSVariable.GetValue('?', $true)
-  if ($null -eq $ec) { $ec = if ($ok) { 0 } else { 1 } }
-  $u  = $env:USERNAME
-  $h  = $env:COMPUTERNAME
-  $wd = (Get-Location).Path
-  $pyCmd = Get-Command python -ErrorAction SilentlyContinue
-  $py = if ($pyCmd) {
-    if ($pyCmd.PSObject.Properties.Match('Path').Count -gt 0 -and $pyCmd.Path) { $pyCmd.Path }
-    elseif ($pyCmd.PSObject.Properties.Match('Source').Count -gt 0 -and $pyCmd.Source) { $pyCmd.Source }
-    else { '' }
-  } else { '' }
-  Write-Output ""
-  Write-Output "###PS1JSON###"
-  $obj = [ordered]@{
-    exit_code = $ec
-    username = $u
-    hostname = $h
-    working_dir = $wd
-    py_interpreter_path = $py
-  }
-  $obj | ConvertTo-Json -Compress
-  Write-Output "###PS1END###"
-  "PS $wd> "
-}
-"""
-            )
-            # 2) Ensure Git is installed (Chocolatey if possible; fallback to official silent installer).
-            #    - Chocolatey official install script: https://community.chocolatey.org/install.ps1
-            #    - git.install package params include /GitOnlyOnPath, /GitAndUnixToolsOnPath, /NoAutoCrlf, etc.
-            #    - Git for Windows silent flags are documented by the project itself.
-            self.send_command(
-                r"""
-# Skip if git already present
-if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
-  try {
-    # Prefer Chocolatey (cleaner package mgmt)
-    if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
-      Set-ExecutionPolicy Bypass -Scope Process -Force
-      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-      Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-    }
 
-    choco install git.install -y --no-progress --params '"/GitOnlyOnPath /NoAutoCrlf"'
-  }
-  catch {
-    Write-Host "Chocolatey install failed: $($_.Exception.Message)  -> falling back to Git for Windows installer"
-
-    # Fallback: Official Git for Windows silent install
-    $ProgressPreference = 'SilentlyContinue'
-    $temp = Join-Path $env:TEMP 'git-installer.exe'
-    # 'latest' link maintained by Git for Windows; resolves to current amd64 EXE
-    $url  = 'https://github.com/git-for-windows/git/releases/latest/download/Git-64-bit.exe'
-    try {
-      Invoke-WebRequest -Uri $url -OutFile $temp
-    } catch {
-      Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $temp
-    }
-
-    # Silent/unattended flags per Git for Windows docs (Inno Setup):
-    # /VERYSILENT /NORESTART /NOCANCEL /SP- /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS
-    # Optional components: icons, ext\reg\shellhere, assoc, assoc_sh, gitlfs, windowsterminal, scalar
-    Start-Process -FilePath $temp -ArgumentList `
-      '/VERYSILENT','/NORESTART','/NOCANCEL','/SP-','/CLOSEAPPLICATIONS','/RESTARTAPPLICATIONS',`
-      '/COMPONENTS="icons,ext\reg\shellhere,assoc,assoc_sh,gitlfs,windowsterminal,scalar"' `
-      -Wait
-  }
-
-  # Ensure PATH is updated in this running session (Chocolatey/Git installers update registry only)
-  $gitCmd = 'C:\Program Files\Git\cmd'
-  $gitBin = 'C:\Program Files\Git\bin'
-  if (Test-Path $gitCmd) { $env:PATH = "$gitCmd;$gitBin;$env:PATH" }
-}
-"""
-            )
-        elif self.platform == "linux":
-            json_str = json.dumps(
-                {
-                    "exit_code": "$?",
-                    "username": r"\u",
-                    "hostname": r"\h",
-                    "working_dir": r"$(pwd)",
-                    "py_interpreter_path": r'$(which python 2>/dev/null || echo "")',
-                },
-                indent=2,
-            ).replace('"', r"\"")
-            ps1 = CMD_OUTPUT_PS1_BEGIN + json_str + CMD_OUTPUT_PS1_END + "\n"
-            self.send_command(f'export PROMPT_COMMAND=\'export PS1="{ps1}"\'; export PS2=""')
-            self.send_command("apt update && apt install -y git")
+        json_str = json.dumps(
+            {
+                "exit_code": "$?",
+                "username": r"\u",
+                "hostname": r"\h",
+                "working_dir": r"$(pwd)",
+                "py_interpreter_path": r'$(which python 2>/dev/null || echo "")',
+            },
+            indent=2,
+        ).replace('"', r"\"")
+        ps1 = CMD_OUTPUT_PS1_BEGIN + json_str + CMD_OUTPUT_PS1_END + "\n"
+        self.send_command(f'export PROMPT_COMMAND=\'export PS1="{ps1}"\'; export PS2=""')
+        self.send_command("apt update && apt install -y git")
         self.stopped = False
 
     def _stream_output(self):
@@ -389,14 +272,8 @@ if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
 
     def send_command(self, command: str, timeout: float = 20 * 60) -> CommandResult:
         # Normalize newline semantics for interactive shells
-        if self.platform == "windows":
-            # For PowerShell, ensure CRLF line endings
-            command = command.strip().replace("\r\n", "\n").replace("\n", "\r\n")
-            # Add extra CRLF for multi-line blocks to signal completion
-            command += "\r\n\r\nprompt\r\n\r\n"
-        else:
-            if not command.endswith("\n"):
-                command += "\n"
+        if not command.endswith("\n"):
+            command += "\n"
 
         while not self.output_queue.empty():
             self.output_queue.get()
@@ -428,46 +305,6 @@ if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
         self.logger(text=result.output)
         return result
 
-    def copy_to_container(self, src: str, dest: str) -> None:
-        """
-        Copy local file or directory 'src' into the container at path 'dest'.
-
-        If 'src' is a directory, all files within that directory (recursively)
-        are placed inside 'dest' in the container. If 'src' is a single file,
-        it is placed inside 'dest' (which is typically a directory).
-        """
-        tar_stream = io.BytesIO()
-        src = os.path.abspath(src)
-
-        with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-            if os.path.isdir(src):
-                # Add directory contents so they appear directly under `dest`.
-                tar.add(src, arcname=".")
-            else:
-                # Add a single file using its basename.
-                tar.add(src, arcname=os.path.basename(src))
-
-        tar_stream.seek(0)
-
-        # Put the archive into the container. `dest` must exist and be a directory
-        # when copying directories, or you'll need to ensure it's the appropriate file path
-        # when copying a single file.
-        self.container.put_archive(dest, tar_stream)
-
-    def copy_dir_to_container(self, src: str, dest: str) -> None:
-
-        src = Path(src)
-        tar_stream = io.BytesIO()
-        with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-            for file_path in src.rglob("*"):
-                arcname = file_path.relative_to(src)
-                tar.add(str(file_path), arcname=str(arcname))
-        tar_stream.seek(0)
-
-        self.container.put_archive(path=dest, data=tar_stream.read())
-        if self.platform == "linux":
-            self.send_command(f'chown -R root:root "{dest}"')
-
     def cleanup(self) -> None:
         if self.stopped:
             return
@@ -477,23 +314,6 @@ if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
             self.stopped = True
         except Exception as e:
             print(f"Failed to stop container: {e}")
-
-    def commit(self, image_name: str, tag: str = "latest", push: bool = False) -> str:
-        self.container.stop()
-
-        self.container.commit(
-            repository=image_name,
-            tag=tag,
-        )
-        print(f"Image {image_name}:{tag} created successfully.")
-
-        if push:
-            client = docker.from_env()
-            client.images.push(image_name, tag=tag)
-            print(f"Image {image_name}:{tag} pushed successfully.")
-
-        self.container.start()
-        return f"{image_name}:{tag}"
 
     def __del__(self):
         self.cleanup()
@@ -522,7 +342,6 @@ if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
         image_name: str,
         instance: dict,
         log_function: Callable = lambda x: None,
-        platform: str = "linux",
     ) -> Runtime:
         """
         Start a Docker container session for repository testing.
@@ -530,7 +349,6 @@ if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
         Args:
             image_name (str): Base Docker image name
             instance (dict): SWE-bench instance data with repo info
-            platform: the platform of the container, linux or windows
 
         Returns:
             SetupRuntime: Configured runtime session ready for command execution
@@ -552,20 +370,12 @@ if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
         # which operating system this code is running on, note windows can run linux containers, so engine_os != (container) platform
         extra_hosts = {"host.docker.internal": "host-gateway"} if "linux" in engine_os else None
 
-        if platform == "windows":
-            shell_command = r"powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -NoExit"
-            working_dir = r"C:\testbed"
-            run_kwargs = {
-                "cpu_count": CPU_CORES,  # cpu_quota is Linux-only
-                "mem_limit": MEM_LIMIT,
-            }
-        else:
-            shell_command = "/bin/bash"
-            working_dir = "/testbed"
-            run_kwargs = {
-                "cpu_quota": int(CPU_CORES * 100000),
-                "mem_limit": MEM_LIMIT,
-            }
+        shell_command = "/bin/bash"
+        working_dir = "/testbed"
+        run_kwargs = {
+            "cpu_quota": int(CPU_CORES * 100000),
+            "mem_limit": MEM_LIMIT,
+        }
 
         container = client.containers.run(
             image_name,
@@ -583,23 +393,6 @@ if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
             **run_kwargs,
         )
 
-        session = cls(container, container_platform=platform, log_function=log_function)
-
-        # We avoid copying due to performance issues
-        # session.copy_dir_to_container(str(workspace), "/workspace")
-
-        # url = f'https://github.com/{instance["repo"]}.git'
-        # base_commit = instance["base_commit"]
-
-        # if platform == "windows":
-        #     res: CommandResult = session.send_command(
-        #        r'git clone {url} "C:\testbed"; cd "C:\testbed"; git reset --hard {base}'.format(
-        #            url=url, base=base_commit
-        #    )
-        # )
-        # else:
-        #    res: CommandResult = session.send_command(
-        #        f"git clone {url} /testbed && cd /testbed && git reset --hard {base_commit}"
-        #    )
+        session = cls(container, log_function=log_function)
 
         return session

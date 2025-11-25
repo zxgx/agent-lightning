@@ -3,7 +3,7 @@ from typing import Literal
 
 import dotenv
 from swebench_utils.docker_runtime import Runtime
-from utils.logger import logger
+from swebench_utils.logger import logger
 
 
 class ClaudeController:
@@ -38,7 +38,6 @@ Please do not commit your edits. We will do it later.
             image,
             instance,
             log_function=partial(logger, run_id=self.run_id, instance_id=instance["instance_id"]),
-            platform="linux",
         )
         container.send_command("curl -fsSL https://claude.ai/install.sh | bash")
         container.send_command('alias claude="$HOME/.local/bin/claude"')
