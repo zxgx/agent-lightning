@@ -1,0 +1,114 @@
+import asyncio
+import time
+
+from algorithm import build_dataset, run_rollout
+from cc_agent import load_dataset
+from transformers import AutoTokenizer
+from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
+from utils.custom_callbacks import AddLogprobs
+
+from agentlightning.llm_proxy import LLMProxy
+from agentlightning.store import LightningStoreClient
+
+
+async def run_parallel_trace_collection(
+    model_path: str,
+    vllm_serve_args_str: str,
+    llm_proxy: str,
+    store,
+    task_dataset,
+    data_adapter,
+    tokenizer,
+    epoch,
+    train_triplet_fraction,
+    dataset_dump_path,
+    span_dump_path,
+) -> None:
+    # 1. Run rollout to get traces
+    start = time.time()
+    completed_rollouts = await run_rollout(
+        model_path=model_path,
+        vllm_serve_args_str=vllm_serve_args_str,
+        llm_proxy=llm_proxy,
+        store=store,
+        task_dataset=task_dataset,
+        enable_lora=epoch > 0,
+    )
+
+    print(f"Trace collection took {time.time() - start} seconds.")
+    start = time.time()
+    # 2. Build dataset from the traces
+    await build_dataset(
+        completed_rollouts=completed_rollouts,
+        store=store,
+        data_adapter=data_adapter,
+        tokenizer=tokenizer,
+        epoch=epoch,
+        train_triplet_fraction=train_triplet_fraction,
+        dataset_dump_path=dataset_dump_path,
+        span_dump_path=span_dump_path,
+    )
+    print(f"Dataset building took {time.time() - start} seconds.")
+
+
+if __name__ == "__main__":
+    from argparse import ArgumentParser
+
+    parser = ArgumentParser()
+    parser.add_argument(
+        "--store_address", type=str, default="http://localhost:4747", help="The address of the LightningStore server."
+    )
+    parser.add_argument("--access_host", type=str, default=None, help="The access host for the LLM proxy server.")
+    parser.add_argument(
+        "--model_name_or_path",
+        type=str,
+        default="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        help="The model name or path for the LLM backend.",
+    )
+    parser.add_argument(
+        "--vllm_serve_args_str",
+        type=str,
+        default="--enable-auto-tool-choice --tool-call-parser qwen3_coder",
+        help="The additional arguments for vLLM serve.",
+    )
+    parser.add_argument("--proxy_port", type=int, default=8765, help="The port for the LLM proxy server.")
+    parser.add_argument(
+        "--train_triplet_fraction",
+        type=float,
+        default=0.8,
+    )
+    parser.add_argument("--dataset_path", type=str, default="swe_debug.jsonl")
+    parser.add_argument(
+        "--dataset_dump_path", type=str, default="datasets", help="If not None, dump the dataset to disk."
+    )
+    parser.add_argument("--span_dump_path", type=str, default="spans", help="If not None, dump the spans to disk.")
+    parser.add_argument("--enable_lora", action="store_true", help="Whether to enable LoRA during trace collection.")
+
+    args = parser.parse_args()
+
+    store = LightningStoreClient(args.store_address)
+    llm_proxy = LLMProxy(
+        port=args.proxy_port, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs]
+    )
+    if args.access_host is not None:
+        llm_proxy.server_launcher.args.access_host = args.access_host
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)  # type: ignore
+
+    data_adapter = LlmProxyTraceToAugmentedTriplet()
+    task_dataset = load_dataset(args.dataset_path, epoch=1 if args.enable_lora else 0)
+    asyncio.run(
+        run_parallel_trace_collection(
+            model_path=args.model_name_or_path,
+            vllm_serve_args_str=args.vllm_serve_args_str,
+            llm_proxy=llm_proxy,
+            store=store,
+            task_dataset=task_dataset,
+            data_adapter=data_adapter,
+            tokenizer=tokenizer,
+            epoch=1 if args.enable_lora else 0,
+            train_triplet_fraction=args.train_triplet_fraction,
+            dataset_dump_path=args.dataset_dump_path,
+            span_dump_path=args.span_dump_path,
+        )
+    )

@@ -64,8 +64,8 @@ def vllm_server(
             vllm_serve_args.extend(vllm_serve_args_str.strip().split())
 
         if enable_lora:
-            vllm_serve_args.extend(['--enable-lora'])
-            
+            vllm_serve_args.extend(["--enable-lora"])
+
         proc = subprocess.Popen(["vllm", "serve", model_path, *vllm_serve_args])
 
         # Wait for the server to be ready
@@ -98,7 +98,12 @@ def vllm_server(
 
 
 async def run_rollout(
-    model_path: str, vllm_serve_args_str: str, llm_proxy: LLMProxy, store: LightningStore, task_dataset: Any, enable_lora: bool = False
+    model_path: str,
+    vllm_serve_args_str: str,
+    llm_proxy: LLMProxy,
+    store: LightningStore,
+    task_dataset: Any,
+    enable_lora: bool = False,
 ) -> List[Rollout]:
     """Rollout to get trace data"""
     with vllm_server(model_path, _find_available_port(), vllm_serve_args_str, enable_lora) as server_address:
@@ -294,7 +299,7 @@ async def run_epoch(
         llm_proxy=llm_proxy,
         store=store,
         task_dataset=task_dataset,
-        enable_lora=epoch>0,
+        enable_lora=epoch > 0,
     )
 
     # 2. Build dataset from the traces
