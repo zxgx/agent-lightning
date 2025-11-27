@@ -63,5 +63,6 @@ if __name__ == "__main__":
     with open(args.agent_config) as f:
         config = yaml.safe_load(f)
 
-    store = LightningStoreClient(args.store_address)
-    spawn_runners(store=store, config=config)
+    for sample in range(config["runtime"]["num_samples"]):
+        store = LightningStoreClient(args.store_address)
+        spawn_runners(store=store, config=config)

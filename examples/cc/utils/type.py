@@ -16,6 +16,7 @@ CC_ALL_TOOLS = {
     "Write",
 }
 
+class AgentConfig(TypedDict):
 
 class SWEbenchInput(TypedDict):
     instance_id: str

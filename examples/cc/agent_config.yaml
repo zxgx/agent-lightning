@@ -46,6 +46,7 @@ agent:
 runtime:
   epochs: 1
   max_step: 40
+  num_samples: 8
   workers: 5
   run_id: reward_design
   run_method: cli
