@@ -17,16 +17,11 @@ Key components:
 """
 
 import json
-import platform
 import traceback
-from argparse import ArgumentParser
 from pathlib import Path, PurePosixPath
+from typing import Any, Dict, Optional
 
-import docker
-
-if platform.system() == "Linux":
-    import resource
-
+from docker.models.containers import ExecResult
 from swebench.harness.constants import (
     APPLY_PATCH_FAIL,
     APPLY_PATCH_PASS,
@@ -34,7 +29,6 @@ from swebench.harness.constants import (
     DOCKER_USER,
     DOCKER_WORKDIR,
     INSTANCE_IMAGE_BUILD_DIR,
-    KEY_INSTANCE_ID,
     KEY_MODEL,
     KEY_PREDICTION,
     LOG_INSTANCE,
@@ -44,27 +38,24 @@ from swebench.harness.constants import (
     UTF8,
     SWEbenchInstance,
 )
+from swebench.harness.docker_build import close_logger  # type: ignore
 from swebench.harness.docker_build import (
     BuildImageError,
     build_container,
-    close_logger,
     setup_logger,
 )
+from swebench.harness.docker_utils import cleanup_container  # type: ignore
+from swebench.harness.docker_utils import exec_run_with_timeout  # type: ignore
+from swebench.harness.docker_utils import remove_image  # type: ignore
+from swebench.harness.docker_utils import should_remove  # type: ignore
 from swebench.harness.docker_utils import (
-    cleanup_container,
     copy_to_container,
-    exec_run_with_timeout,
-    remove_image,
-    should_remove,
 )
 from swebench.harness.grading import get_eval_report
 from swebench.harness.test_spec.test_spec import TestSpec, make_test_spec
-from swebench.harness.utils import (
-    EvaluationError,
-    get_predictions_from_file,
-    load_swebench_dataset,
-    str2bool,
-)
+from swebench.harness.utils import EvaluationError
+
+import docker
 
 GIT_APPLY_CMDS = [
     "git apply --verbose",
@@ -75,7 +66,7 @@ GIT_APPLY_CMDS = [
 
 def run_instance(
     test_spec: TestSpec,
-    pred: dict,
+    pred: Dict[str, Any],
     rm_image: bool,
     force_rebuild: bool,
     client: docker.DockerClient,
@@ -149,23 +140,22 @@ def run_instance(
         patch_file = Path(log_dir / "patch.diff")
         patch_file.write_text(pred[KEY_PREDICTION] or "")
         logger.info(f"Intermediate patch for {instance_id} written to {patch_file}, now applying to container...")
-        copy_to_container(container, patch_file, PurePosixPath(DOCKER_PATCH))
+        copy_to_container(container, patch_file, PurePosixPath(DOCKER_PATCH))  # type: ignore
 
         # Attempt to apply patch to container (TODO: FIX THIS)
-        applied_patch = False
+        val: Optional[ExecResult] = None
         for git_apply_cmd in GIT_APPLY_CMDS:
-            val = container.exec_run(
+            val = container.exec_run(  # type: ignore
                 f"{git_apply_cmd} {DOCKER_PATCH}",
                 workdir=DOCKER_WORKDIR,
                 user=DOCKER_USER,
             )
             if val.exit_code == 0:
                 logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode(UTF8)}")
-                applied_patch = True
                 break
             else:
                 logger.info(f"Failed to apply patch to container: {git_apply_cmd}")
-        if not applied_patch:
+        if val is not None:
             logger.info(f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}")
             raise EvaluationError(
                 instance_id,
@@ -175,14 +165,14 @@ def run_instance(
 
         # Get git diff before running eval script
         git_diff_output_before = (
-            container.exec_run("git -c core.fileMode=false diff", workdir=DOCKER_WORKDIR).output.decode(UTF8).strip()
+            container.exec_run("git -c core.fileMode=false diff", workdir=DOCKER_WORKDIR).output.decode(UTF8).strip()  # type: ignore
         )
         logger.info(f"Git diff before:\n{git_diff_output_before}")
 
         eval_file = Path(log_dir / "eval.sh")
         eval_file.write_text(test_spec.eval_script)
         logger.info(f"Eval script for {instance_id} written to {eval_file}; copying to container...")
-        copy_to_container(container, eval_file, PurePosixPath("/eval.sh"))
+        copy_to_container(container, eval_file, PurePosixPath("/eval.sh"))  # type: ignore
 
         # Run eval script, write output to logs
         test_output, timed_out, total_runtime = exec_run_with_timeout(container, "/bin/bash /eval.sh", timeout)
@@ -201,7 +191,7 @@ def run_instance(
 
         # Get git diff after running eval script (ignore permission changes)
         git_diff_output_after = (
-            container.exec_run("git -c core.fileMode=false diff", workdir=DOCKER_WORKDIR).output.decode(UTF8).strip()
+            container.exec_run("git -c core.fileMode=false diff", workdir=str(DOCKER_WORKDIR)).output.decode(UTF8).strip()  # type: ignore
         )
 
         # Check if git diff changed after running eval script
@@ -232,11 +222,7 @@ def run_instance(
         logger.info(error_msg)
         print(e)
     except Exception as e:
-        error_msg = (
-            f"Error in evaluating model for {instance_id}: {e}\n"
-            f"{traceback.format_exc()}\n"
-            f"Check ({logger.log_file}) for more information."
-        )
+        error_msg = f"Error in evaluating model for {instance_id}: {e}\n" f"{traceback.format_exc()}"
         logger.error(error_msg)
     finally:
         # Remove instance container + image, close logger
@@ -248,16 +234,16 @@ def run_instance(
 
 
 def evaluate(
-    prediction: dict,
+    prediction: Dict[str, Any],
     instance: SWEbenchInstance,
-    cache_level,
-    clean,
-    force_rebuild,
-    run_id,
-    timeout,
-    namespace,
-    instance_image_tag,
-    rewrite_reports,
+    cache_level: str,
+    clean: bool,
+    force_rebuild: bool,
+    run_id: str,
+    timeout: Optional[int],
+    namespace: Optional[str],
+    instance_image_tag: str,
+    rewrite_reports: bool,
 ):
     client = docker.from_env()
     test_spec = make_test_spec(instance, namespace=namespace, instance_image_tag=instance_image_tag)
@@ -277,132 +263,3 @@ def evaluate(
         timeout,
         rewrite_reports,
     )
-
-
-def filter_dataset_by_predictions(predictions, dataset_name, split):
-    full_dataset = load_swebench_dataset(dataset_name, split)
-    full_dataset_ids = {i[KEY_INSTANCE_ID] for i in full_dataset}
-
-    prediction_ids = set(predictions.keys())
-    if prediction_ids - full_dataset_ids:
-        raise ValueError(
-            (
-                "Some prediction IDs not found in dataset!"
-                f"\nMissing IDs:\n{' '.join(prediction_ids - full_dataset_ids)}"
-            )
-        )
-
-    empty_patch_ids = {k for k, v in predictions.items() if v[KEY_PREDICTION] == "" or v[KEY_PREDICTION] is None}
-    # filter dataset to only instances with predictions
-    dataset = {
-        i[KEY_INSTANCE_ID]: i
-        for i in full_dataset
-        if i[KEY_INSTANCE_ID] in prediction_ids and i[KEY_INSTANCE_ID] not in empty_patch_ids
-    }
-    return dataset, full_dataset
-
-
-def main(
-    dataset_name: str,
-    split: str,
-    predictions_path: str,
-    force_rebuild: bool,
-    cache_level: str,
-    clean: bool,
-    open_file_limit: int,
-    run_id: str,
-    timeout: int,
-    namespace: str | None,
-    rewrite_reports: bool,
-    instance_image_tag: str = "latest",
-):
-    # load predictions as map of instance_id to prediction
-    predictions = get_predictions_from_file(predictions_path, dataset_name, split)
-    predictions = {pred[KEY_INSTANCE_ID]: pred for pred in predictions}
-
-    dataset, _ = filter_dataset_by_predictions(predictions, dataset_name, split)
-
-    # run instances locally
-    if platform.system() == "Linux":
-        resource.setrlimit(resource.RLIMIT_NOFILE, (open_file_limit, open_file_limit))
-
-    results = {}
-    print(f"Running evaluation for {len(predictions)} predictions...")
-    for instance_id in predictions:
-        if instance_id not in dataset:
-            results[instance_id] = None
-            print(f"Skipping instance {instance_id} as it has empty patch...")
-            continue
-
-        print(f"Evaluating instance {instance_id}...")
-        result = evaluate(
-            predictions[instance_id],
-            dataset[instance_id],
-            cache_level,
-            clean,
-            force_rebuild,
-            run_id,
-            timeout,
-            namespace=namespace,
-            instance_image_tag=instance_image_tag,
-            rewrite_reports=rewrite_reports,
-        )
-        results[instance_id] = result
-
-    with open(f"debug.json", "w") as f:
-        json.dump(results, f, indent=4)
-
-
-if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument(
-        "--dataset_name",
-        default="SWE-bench/SWE-bench_Lite",
-        type=str,
-        help="Name of dataset or path to JSON file.",
-    )
-    parser.add_argument("--split", type=str, default="test", help="Split of the dataset")
-    parser.add_argument(
-        "--predictions_path",
-        type=str,
-        help="Path to predictions file - if 'gold', uses gold predictions",
-        required=True,
-    )
-
-    # Local execution args
-    parser.add_argument("--open_file_limit", type=int, default=4096, help="Open file limit")
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=1_800,
-        help="Timeout (in seconds) for running tests for each instance",
-    )
-    parser.add_argument(
-        "--force_rebuild",
-        type=str2bool,
-        default=False,
-        help="Force rebuild of all images",
-    )
-    parser.add_argument(
-        "--cache_level",
-        type=str,
-        choices=["none", "base", "env", "instance"],
-        help="Cache level - remove images above this level",
-        default="env",
-    )
-    # if clean is true then we remove all images that are above the cache level
-    # if clean is false, we only remove images above the cache level if they don't already exist
-    parser.add_argument("--clean", type=str2bool, default=False, help="Clean images above cache level")
-    parser.add_argument("--run_id", type=str, required=True, help="Run ID - identifies the run")
-    parser.add_argument("--namespace", type=str, default="swebench", help="Namespace for images")
-    parser.add_argument("--instance_image_tag", type=str, default="latest", help="Instance image tag")
-    parser.add_argument(
-        "--rewrite_reports",
-        type=str2bool,
-        default=False,
-        help="Doesn't run new instances, only writes reports for instances with existing test outputs",
-    )
-
-    # Add arguments to the parser
-    args = parser.parse_args()
-    main(**vars(args))

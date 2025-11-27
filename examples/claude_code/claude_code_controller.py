@@ -14,7 +14,7 @@ Key features:
 """
 
 from functools import partial
-from typing import Literal
+from typing import Any, Dict, Literal
 
 import dotenv
 from swebench_utils.docker_runtime import Runtime
@@ -39,7 +39,7 @@ You task is to fix the bug with the following steps:
 Please do not commit your edits. We will do it later.
 """
 
-    def __init__(self, image: str, instance: dict, run_id: str, endpoint: str, api_key: str) -> None:
+    def __init__(self, image: str, instance: Dict[str, Any], run_id: str, endpoint: str, api_key: str) -> None:
         self.image = image
         self.instance = instance
         self.run_id = run_id
@@ -48,7 +48,7 @@ Please do not commit your edits. We will do it later.
         self.container: Runtime = self.init_container(self.image, self.instance)
         return
 
-    def init_container(self, image: str, instance: dict) -> Runtime:
+    def init_container(self, image: str, instance: Dict[str, Any]) -> Runtime:
         container = Runtime.start_session(
             image,
             instance,
@@ -66,7 +66,7 @@ Please do not commit your edits. We will do it later.
         container.send_command("export IS_SANDBOX=1")
         return container
 
-    def _run_cli(self, instance: dict, max_step: int, timelimit: int):
+    def _run_cli(self, instance: Dict[str, Any], max_step: int, timelimit: int) -> None:
         # prepare prompt safely: write it to a file inside the container using a single-quoted heredoc
         # directly applying prompt for heredoc may raise error for windows line ending \r\n
         prompt_text = self.user_prompt.format(description=instance["problem_statement"].replace('"""', "'''"))
@@ -92,7 +92,7 @@ Please do not commit your edits. We will do it later.
         # self.container.send_command("cat /tmp/hook.out")
         return
 
-    def _run_python_sdk(self, instance: dict, max_step: int, timelimit: int):
+    def _run_python_sdk(self, instance: Dict[str, Any], max_step: int, timelimit: int):
         self.container.send_command(
             f"""
 if ! command -v python3 &> /dev/null; then
@@ -114,8 +114,12 @@ fi
         return
 
     def run_instance(
-        self, instance: dict, max_step: int = 40, timelimit: int = 30, run_method: Literal["python", "cli"] = "python"
-    ) -> dict:
+        self,
+        instance: Dict[str, Any],
+        max_step: int = 40,
+        timelimit: int = 30,
+        run_method: Literal["python", "cli"] = "python",
+    ) -> Dict[str, Any]:
         """
         timelimit: in minute
         """

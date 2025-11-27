@@ -16,8 +16,9 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+from docker.errors import DockerException, ImageNotFound
 from docker.models.containers import Container
 from typing_extensions import Self
 
@@ -62,8 +63,8 @@ class CmdOutputMetadata:
     py_interpreter_path: str | None = None
 
     @classmethod
-    def matches_ps1_metadata(cls, output: str) -> list[re.Match[str]]:
-        matches = []
+    def matches_ps1_metadata(cls, output: str) -> List[re.Match[str]]:
+        matches: List[re.Match[str]] = []
         for match in CMD_OUTPUT_METADATA_PS1_REGEX.finditer(output):
             scope = match.group(1).strip()
             try:
@@ -76,8 +77,8 @@ class CmdOutputMetadata:
         return matches
 
     @classmethod
-    def best_effort_match(cls, scope: str) -> dict:
-        out = {}
+    def best_effort_match(cls, scope: str) -> Dict[str, Any]:
+        out: Dict[str, str] = {}
         for field, pattern in VAR_PATTERNS.items():
             m = pattern.search(scope)
             if m:
@@ -160,7 +161,7 @@ class Runtime:
     file operations, and container lifecycle management.
     """
 
-    def __init__(self, container: Container, log_function: Callable):
+    def __init__(self, container: Container, log_function: Callable[..., None]) -> None:
         """
         Initialize runtime with an existing Docker container.
 
@@ -169,8 +170,8 @@ class Runtime:
         """
         self.container = container
         self.logger = log_function  # Set logger early so it's available even if init fails later
-        self.sock = self.container.attach_socket(params={"stdin": 1, "stdout": 1, "stderr": 1, "stream": 1})
-        self.output_queue = queue.Queue()
+        self.sock: Any = self.container.attach_socket(params={"stdin": 1, "stdout": 1, "stderr": 1, "stream": 1})  # type: ignore
+        self.output_queue: queue.Queue[bytes] = queue.Queue()
         self._start_output_thread()
         self._clear_initial_prompt()
 
@@ -212,7 +213,7 @@ class Runtime:
         while not self.output_queue.empty():
             self.output_queue.get()
 
-    def _read_raw_output(self, timeout=30) -> tuple[str, Optional[CmdOutputMetadata]]:
+    def _read_raw_output(self, timeout: float = 30) -> tuple[str, Optional[CmdOutputMetadata]]:
         accumulated_output = ""
         start_time = time.time()
 
@@ -241,13 +242,13 @@ class Runtime:
             return pane_content[: ps1_matches[0].start()]
         elif len(ps1_matches) == 0:
             return pane_content
-        output_segments = []
+        output_segments: List[str] = []
         for i in range(len(ps1_matches) - 1):
             output_segment = pane_content[ps1_matches[i].end() + 1 : ps1_matches[i + 1].start()]
             output_segments.append(output_segment)
         return "\n".join(output_segments) + "\n" if output_segments else ""
 
-    def _recv_bytes(self, n=4096) -> bytes:
+    def _recv_bytes(self, n: int = 4096) -> bytes:
         # Prefer the public API on whatever object the SDK returns
         for m in ("recv", "read"):
             if hasattr(self.sock, m):
@@ -335,15 +336,15 @@ class Runtime:
         try:
             client.images.pull(image_name)
             return True
-        except docker.errors.ImageNotFound:
+        except ImageNotFound:
             return False
 
     @classmethod
     def start_session(
         cls,
         image_name: str,
-        instance: dict,
-        log_function: Callable = lambda x: None,
+        instance: dict[Any, Any],
+        log_function: Callable[..., None] = lambda: None,
     ) -> Runtime:
         """
         Start a Docker container session for repository testing.
@@ -359,25 +360,21 @@ class Runtime:
             RuntimeError: If Docker is not available
         """
         try:
-            docker.from_env().ping()
-        except docker.errors.DockerException:
+            docker.from_env().ping()  # type: ignore
+        except DockerException:
             raise RuntimeError("Docker is not installed or not running.")
 
         _ = cls.pull_image(image_name)
         client = docker.from_env(timeout=600)
         container_id = instance["instance_id"]
         container_name = f"git-launch-{container_id}-{str(uuid.uuid4())[:4]}"
-        info = client.version()
-        engine_os = (info.get("Os") or info.get("OSType") or "").lower()
+        info: Dict[str, str] = client.version()  # type: ignore
+        engine_os: str = (info.get("Os") or info.get("OSType") or "").lower()  # type: ignore
         # which operating system this code is running on, note windows can run linux containers, so engine_os != (container) platform
         extra_hosts = {"host.docker.internal": "host-gateway"} if "linux" in engine_os else None
 
         shell_command = "/bin/bash"
         working_dir = "/testbed"
-        run_kwargs = {
-            "cpu_quota": int(CPU_CORES * 100000),
-            "mem_limit": MEM_LIMIT,
-        }
 
         container = client.containers.run(
             image_name,
@@ -392,7 +389,8 @@ class Runtime:
             working_dir=working_dir,
             extra_hosts=extra_hosts,
             network_mode="host",
-            **run_kwargs,
+            cpu_quota=int(CPU_CORES * 100000),
+            mem_limit=MEM_LIMIT,
         )
 
         session = cls(container, log_function=log_function)

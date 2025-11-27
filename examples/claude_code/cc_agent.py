@@ -16,20 +16,18 @@ import asyncio
 import json
 import os
 import platform
+import resource
 import time
-from typing import Any, Dict, List, Literal, Optional
-
-if platform.system() == "Linux":
-    import resource
+from typing import Any, Dict, List, Literal, Optional, cast
 
 from claude_code_controller import ClaudeController
 from custom_adapter import LlmProxyTraceToAugmentedTriplet
 from custom_callbacks import AddLogprobs
 from datasets import Dataset
-from swebench.harness.utils import load_swebench_dataset
+from swebench.harness.utils import load_swebench_dataset  # type: ignore
 from swebench_utils.evaluation import evaluate
 from swebench_utils.logger import logger
-from transformers import AutoProcessor
+from transformers import AutoTokenizer
 
 from agentlightning import (
     InMemoryLightningStore,
@@ -40,11 +38,11 @@ from agentlightning import (
 )
 from agentlightning.litagent import LitAgent
 from agentlightning.llm_proxy import LLMProxy, ModelConfig
-from agentlightning.types import LLM, AttemptedRollout, NamedResources, ProxyLLM, Rollout, RolloutRawResult
+from agentlightning.types import LLM, AttemptedRollout, NamedResources, ProxyLLM, Rollout, RolloutRawResult, Span
 
 
-def load_dataset(path: str = "swe_debug.jsonl", epoch: int = 0, limit: Optional[int] = None) -> Dict[str, Any]:
-    instances = []
+def load_dataset(path: str = "swe_debug.jsonl", epoch: int = 0, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    instances: List[Dict[str, Any]] = []
     with open(path) as f:
         for line in f:
             instance = json.loads(line)
@@ -56,7 +54,7 @@ def load_dataset(path: str = "swe_debug.jsonl", epoch: int = 0, limit: Optional[
     return instances
 
 
-class CodingAgent(LitAgent):
+class CodingAgent(LitAgent[Dict[str, Any]]):
     def __init__(
         self,
         namespace: Literal["swebench", "starryzhang"] = "swebench",
@@ -99,7 +97,7 @@ class CodingAgent(LitAgent):
         run_id = f"epoch_{task.get('epoch', 0)}"
         image = f"{self.namespace}/sweb.eval.x86_64.{task['instance_id'].lower()}".replace("__", "_1776_")
 
-        llm = resources.get("llm")
+        llm = cast(ProxyLLM, resources.get("llm"))
         assert llm is not None, "LLM resource is required for rollout."
 
         llm = self._strip_proxy_helper(llm, rollout)
@@ -110,10 +108,13 @@ class CodingAgent(LitAgent):
                 image, task, run_id, llm.endpoint, llm.api_key or os.environ.get("ANTHROPIC_AUTH_TOKEN", "dummy")
             )
             # 2. execute task
-            prediction = controller.run_instance(task, max_step=self.max_step, run_method=self.run_method)
+            prediction = controller.run_instance(
+                task, max_step=self.max_step, run_method=cast(Literal["python", "cli"], self.run_method)
+            )
             del controller
         except Exception as e:
             logger(run_id, task["instance_id"], f"Exception during rollout: {e}")
+            return 0.0
 
         # 3. obtain rewards (evaluation result)
         reward = 0.0
@@ -199,7 +200,13 @@ def flatten_messages(messages: List[Any]) -> List[Dict[str, str]]:
 
 
 async def cc_agent_dry_run_sample(
-    model_path, server_address, dataset_path, sonnet_name, haiku_name, max_step, output_dir
+    model_path: str,
+    server_address: str,
+    dataset_path: str,
+    sonnet_name: str,
+    haiku_name: str,
+    max_step: int,
+    output_dir: Optional[str],
 ) -> None:
     """Run a dry run of the cc agent on a single sample.
 
@@ -207,12 +214,13 @@ async def cc_agent_dry_run_sample(
     using a single worker. Useful for testing the setup and configuration.
     """
     dataset = load_dataset(dataset_path, limit=4)
-    tokenizer = AutoProcessor.from_pretrained(model_path)
+    # from_pretrained has partially unknown typing in some stubs; cast via Any to satisfy type-checkers.
+    tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(model_path)  # type: ignore
 
     logging = configure_logger(name="Claude Code Agent")
 
     tracer = OtelTracer()
-    runner = LitAgentRunner(tracer)
+    runner = LitAgentRunner[Dict[str, Any]](tracer)
     adapter = LlmProxyTraceToAugmentedTriplet()
     store = LightningStoreServer(InMemoryLightningStore(), host="0.0.0.0", port=7654)
     llm_proxy = LLMProxy(port=12358, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs])
@@ -252,7 +260,7 @@ async def cc_agent_dry_run_sample(
         )
 
         spans = await store.query_spans(rollout.rollout_id)
-        triplets = adapter.adapt(spans)
+        triplets = adapter.adapt(cast(List[Span], spans))
         logging.info(f"dump {len(spans)} spans, extract {len(triplets)} triplets")
         if output_dir is not None:
             with open(os.path.join(output_dir, f"stream_{dataset[0]['instance_id']}.json"), "w") as f:
@@ -280,17 +288,17 @@ async def cc_agent_dry_run_sample(
                     }
                 )
 
-            ds = Dataset.from_list(all_triplets)
-            ds.save_to_disk(os.path.join(output_dir, f"dataset-{dataset[0]['instance_id']}"))
+            ds = Dataset.from_list(all_triplets)  # type: ignore
+            ds.save_to_disk(os.path.join(output_dir, f"dataset-{dataset[0]['instance_id']}"))  # type: ignore
             logging.info(f"Saved dataset with {len(ds)} samples to dataset-{dataset[0]['instance_id']}")
 
 
 async def gold_cc_agent_run_dataset(
-    sonnet_name,
-    haiku_name,
-    max_step,
-    dataset_path,
-    output_dir,
+    sonnet_name: str,
+    haiku_name: str,
+    max_step: int,
+    dataset_path: str,
+    output_dir: Optional[str],
 ):
     """Run a dry run of the cc agent on a single sample.
 
@@ -302,7 +310,7 @@ async def gold_cc_agent_run_dataset(
     logging = configure_logger(name="Claude Code Agent")
 
     tracer = OtelTracer()
-    runner = LitAgentRunner(tracer)
+    runner = LitAgentRunner[Dict[str, Any]](tracer)
     store = LightningStoreServer(InMemoryLightningStore(), host="0.0.0.0", port=7654)
     llm_proxy = LLMProxy(port=12358, store=store)
 
