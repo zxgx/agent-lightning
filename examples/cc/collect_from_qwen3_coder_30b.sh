@@ -22,7 +22,7 @@
 # - Qwen/Qwen3-4B-Instruct-2507 - hermes
 
 export NCCL_DEBUG=WARN
-export HF_HOME=/mnt/input/cache/huggingface
+export HF_HOME=$HOME/.cache/huggingface
 
 
 # Make it able to receive named cmd args, --model_tag, --tool_call_parser, --num_samples
