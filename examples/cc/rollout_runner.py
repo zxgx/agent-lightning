@@ -1,4 +1,6 @@
 import yaml
+import os
+import shutil
 
 import asyncio
 import multiprocessing
@@ -66,3 +68,11 @@ if __name__ == "__main__":
     for sample in range(config["runtime"]["num_samples"]):
         store = LightningStoreClient(args.store_address)
         spawn_runners(store=store, config=config)
+        
+        # Move logs to sample-specific directory
+        logs_dir = "logs"
+        target_dir = f"logs_sample_{sample}"
+        if os.path.exists(logs_dir):
+            if os.path.exists(target_dir):
+                shutil.rmtree(target_dir)
+            shutil.move(logs_dir, target_dir)

@@ -16,7 +16,29 @@ CC_ALL_TOOLS = {
     "Write",
 }
 
+class DatasetConfig(TypedDict):
+    dataset_dir: str
+    namespace: str
+    full_set: str
+    split: str
+
+class CCConfig(TypedDict):
+    tools: str
+    user_prompt: str
+
+class RumtimeConfig(TypedDict):
+    epochs: int
+    max_step: int
+    workers: int
+    num_samples: int
+    run_id: str
+    run_method: Literal["cli", "python"]
+    overwrite: bool
+
 class AgentConfig(TypedDict):
+    dataset: DatasetConfig
+    agent: CCConfig
+    runtime: RumtimeConfig
 
 class SWEbenchInput(TypedDict):
     instance_id: str
