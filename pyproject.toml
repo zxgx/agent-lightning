@@ -196,7 +196,7 @@ crewai = [
   "crewai[tools]>=1.2.0,!=1.2.1,!=1.3.0,!=1.4.0,!=1.4.1,!=1.5.0",
 ]
 swebench = [
-  "swebench==4.1.0",
+  "swebench",
 ]
 
 # Summarize into large installable groups.
