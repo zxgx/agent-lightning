@@ -1,0 +1,39 @@
+dataset:
+  dataset_path: swe_debug.jsonl
+  namespace: swebench
+  full_set: princeton-nlp/SWE-bench
+  split: test
+
+agent:
+  tools:
+    - Glob
+    - Grep
+    - Bash
+    - Read
+    - Edit
+    - Write
+    - TodoWrite
+    - WebFetch
+    - ExitPlanMode
+
+  user_prompt: |-
+    You are given a code repository in the current directory (/testbed).
+    The bug description is:
+    {description}
+    =================================================
+    You task is to fix the bug with the following steps:
+    (1) write test cases to reproduce the bug.
+    (2) explore the source codes to locate the bug.
+    (3) edit the source codes to fix the bug.
+    (4) rerun your written test cases to validate that the bug is fixed. If not, go back to explore the source codes and fix the codes again.
+    (5) remember to delete the test cases you write at last.
+    Please do not commit your edits. We will do it later.
+
+runtime:
+  epochs: 1
+  max_step: 40
+  num_samples: 8
+  workers: 5
+  run_id: reward_design
+  run_method: cli
+  overwrite: 1

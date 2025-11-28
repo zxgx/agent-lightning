@@ -5,7 +5,7 @@ from algorithm import build_dataset, run_rollout
 from cc_agent import load_dataset
 from transformers import AutoTokenizer
 from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
-from utils.custom_callbacks import AddLogprobs
+from utils.custom_callbacks import AddLogprobs, AddTemperature
 
 from agentlightning.llm_proxy import LLMProxy
 from agentlightning.store import LightningStoreClient
@@ -88,7 +88,7 @@ if __name__ == "__main__":
 
     store = LightningStoreClient(args.store_address)
     llm_proxy = LLMProxy(
-        port=args.proxy_port, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs]
+        port=args.proxy_port, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs, AddTemperature]
     )
     if args.access_host is not None:
         llm_proxy.server_launcher.args.access_host = args.access_host

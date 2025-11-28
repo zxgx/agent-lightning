@@ -1,3 +1,7 @@
+import yaml
+import os
+import shutil
+
 import asyncio
 import multiprocessing
 from typing import Any, Dict
@@ -8,26 +12,37 @@ from rich.console import Console
 from agentlightning import LitAgentRunner, configure_logger
 from agentlightning.store import LightningStore, LightningStoreClient
 from agentlightning.tracer import OtelTracer
+from examples.cc.utils.type import AgentConfig
 
 console = Console()
 
 
-def run_rollout(*, max_step: int, store: LightningStore, worker_id: int) -> None:
+def run_rollout(*, store: LightningStore, config: AgentConfig, worker_id: int) -> None:
     tracer = OtelTracer()
     runner = LitAgentRunner[Dict[str, Any]](tracer)
 
     console.print(f"[bold green]Runners: [/bold green] Rollout runner {worker_id} started.")
 
-    with runner.run_context(agent=CodingAgent(max_step=max_step), store=store, worker_id=worker_id):
+    agent = CodingAgent(
+        namespace=config["dataset"]["namespace"],
+        full_set=config["dataset"]["full_set"],
+        split=config["dataset"]["split"],
+        max_step=config["runtime"]["max_step"],
+        run_method=config["runtime"]["run_method"],
+        tools=config["agent"]["tools"],
+        user_prompt=config["agent"]["user_prompt"]
+    )
+
+    with runner.run_context(agent=agent, store=store, worker_id=worker_id):
         asyncio.run(runner.iter())
 
 
-def spawn_runners(*, store: LightningStore, n_runners: int, max_step: int) -> None:
+def spawn_runners(*, store: LightningStore, config: AgentConfig) -> None:
     runners = [
         multiprocessing.Process(
-            target=run_rollout, kwargs={"max_step": max_step, "store": store, "worker_id": worker_id}
+            target=run_rollout, kwargs={"store": store, "config": config, "worker_id": worker_id}
         )
-        for worker_id in range(n_runners)
+        for worker_id in range(config["runtime"]["workers"])
     ]
     for runner in runners:
         runner.start()
@@ -44,9 +59,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--store_address", type=str, default="http://localhost:4747", help="The address of the LightningStore server."
     )
-    parser.add_argument("--max_step", type=int, default=5, help="Maximum steps per instance.")
-    parser.add_argument("--n_runners", type=int, default=4, help="Number of rollout runners to spawn.")
+    parser.add_argument("--agent_config", type=str, default="agent_config.yaml", help="Agent config to run Claude Code.")
 
     args = parser.parse_args()
-    store = LightningStoreClient(args.store_address)
-    spawn_runners(store=store, n_runners=args.n_runners, max_step=args.max_step)
+
+    with open(args.agent_config) as f:
+        config = yaml.safe_load(f)
+
+    for sample in range(config["runtime"]["num_samples"]):
+        store = LightningStoreClient(args.store_address)
+        spawn_runners(store=store, config=config)
+        
+        # Move logs to sample-specific directory
+        logs_dir = "logs"
+        target_dir = f"logs_sample_{sample}"
+        if os.path.exists(logs_dir):
+            if os.path.exists(target_dir):
+                shutil.rmtree(target_dir)
+            shutil.move(logs_dir, target_dir)

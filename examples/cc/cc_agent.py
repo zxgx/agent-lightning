@@ -1,5 +1,5 @@
 import asyncio
-import json
+import json, yaml
 import os
 import platform
 import time
@@ -16,6 +16,7 @@ from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
 from utils.custom_callbacks import AddLogprobs
 from utils.evaluation import evaluate
 from utils.logger import logger
+from utils.type import AgentResult
 
 from agentlightning import (
     InMemoryLightningStore,
@@ -50,6 +51,8 @@ class CodingAgent(LitAgent):
         split: str = "test",
         max_step: int = 5,
         run_method: Literal["python", "cli"] = "cli",
+        tools: list[str] = ["Glob","Grep","Bash","Read","Edit","Write","TodoWrite","WebFetch","ExitPlanMode"],
+        user_prompt: str = "{description}",
         open_file_limit: int = 4096,
         cache_level: str = "env",  # ["none", "base", "env", "instance"]
         clean: bool = False,
@@ -75,6 +78,9 @@ class CodingAgent(LitAgent):
         full_dataset = load_swebench_dataset(full_set, split)
         self.dataset = {each["instance_id"]: each for each in full_dataset}
 
+        self.tools = tools
+        self.user_prompt = user_prompt
+
         # run instances locally
         if platform.system() == "Linux":
             resource.setrlimit(resource.RLIMIT_NOFILE, (open_file_limit, open_file_limit))
@@ -93,10 +99,17 @@ class CodingAgent(LitAgent):
         try:
             # 1. init container
             controller = ClaudeController(
-                image, task, run_id, llm.endpoint, llm.api_key or os.environ.get("ANTHROPIC_AUTH_TOKEN", "dummy")
+                image, 
+                task, 
+                run_id, 
+                set(self.tools),
+                self.user_prompt,
+                llm.endpoint, 
+                llm.api_key or os.environ.get("ANTHROPIC_AUTH_TOKEN", "dummy"),
             )
             # 2. execute task
-            prediction = controller.run_instance(task, max_step=self.max_step, run_method=self.run_method)
+            prediction: AgentResult = controller.run_instance(task, max_step=self.max_step, run_method=self.run_method)
+            logger(run_id, task["instance_id"], json.dumps(prediction, indent=4))
             del controller
         except Exception as e:
             logger(run_id, task["instance_id"], f"Exception during rollout: {e}")
@@ -185,14 +198,15 @@ def flatten_messages(messages: List[Any]) -> List[Dict[str, str]]:
 
 
 async def cc_agent_dry_run_sample(
-    model_path, server_address, dataset_path, sonnet_name, haiku_name, max_step, output_dir
+    model_path, server_address, sonnet_name, haiku_name, output_dir, config,
 ) -> None:
     """Run a dry run of the cc agent on a single sample.
 
     This is a simple test function that runs the math agent on the first 4 problems
     using a single worker. Useful for testing the setup and configuration.
     """
-    dataset = load_dataset(dataset_path, limit=4)
+
+    dataset = load_dataset(config["dataset"]["dataset_path"], limit=4)
     tokenizer = AutoProcessor.from_pretrained(model_path)
 
     logging = configure_logger(name="Claude Code Agent")
@@ -232,7 +246,17 @@ async def cc_agent_dry_run_sample(
         }
     )
 
-    with runner.run_context(agent=CodingAgent(max_step=max_step), store=store):
+    agent = CodingAgent(
+        namespace=config["dataset"]["namespace"],
+        full_set=config["dataset"]["full_set"],
+        split=config["dataset"]["split"],
+        max_step=config["runtime"]["max_step"],
+        run_method=config["runtime"]["run_method"],
+        tools=config["agent"]["tools"],
+        user_prompt=config["agent"]["user_prompt"]
+    )
+    
+    with runner.run_context(agent=agent, store=store):
         rollout = await runner.step(
             dataset[0],
         )
@@ -274,16 +298,15 @@ async def cc_agent_dry_run_sample(
 async def gold_cc_agent_run_dataset(
     sonnet_name,
     haiku_name,
-    max_step,
-    dataset_path,
     output_dir,
+    config,
 ):
     """Run a dry run of the cc agent on a single sample.
 
     This is a simple test function that runs the math agent on the first 4 problems
     using a single worker. Useful for testing the setup and configuration.
     """
-    dataset = load_dataset(dataset_path)
+    dataset = load_dataset(config["dataset"]["dataset_path"])
 
     logging = configure_logger(name="Claude Code Agent")
 
@@ -316,7 +339,16 @@ async def gold_cc_agent_run_dataset(
     )
 
     for each in dataset:
-        with runner.run_context(agent=CodingAgent(max_step=max_step), store=store):
+        agent = CodingAgent(
+            namespace=config["dataset"]["namespace"],
+            full_set=config["dataset"]["full_set"],
+            split=config["dataset"]["split"],
+            max_step=config["runtime"]["max_step"],
+            run_method=config["runtime"]["run_method"],
+            tools=config["agent"]["tools"],
+            user_prompt=config["agent"]["user_prompt"]
+        )
+        with runner.run_context(agent=agent, store=store):
             rollout = await runner.step(each)
             spans = await store.query_spans(rollout.rollout_id)
 
@@ -349,11 +381,13 @@ if __name__ == "__main__":
         "--sonnet_name", type=str, default="claude-sonnet-4-5-20250929", help="Name of the sonnet model."
     )
     parser.add_argument("--haiku_name", type=str, default="claude-haiku-4-5-20251001", help="Name of the haiku model.")
-    parser.add_argument("--dataset_path", type=str, default="swe_debug.jsonl", help="Path to the dataset.")
-    parser.add_argument("--max_step", type=int, default=5, help="Maximum steps per instance.")
     parser.add_argument("--output_dir", type=str, default="data", help="Directory to save output logs.")
+    parser.add_argument("--agent_config", type=str, default="agent_config.yaml", help="Configs to run claude code.")
 
     args = parser.parse_args()
+
+    with open(args.agent_config) as f:
+        config = yaml.safe_load(f)
 
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -363,11 +397,10 @@ if __name__ == "__main__":
             cc_agent_dry_run_sample(
                 model_path=args.model_name_or_path,
                 server_address=args.server_address,
-                dataset_path=args.dataset_path,
                 sonnet_name=args.sonnet_name,
                 haiku_name=args.haiku_name,
-                max_step=args.max_step,
                 output_dir=args.output_dir,
+                config=config,
             )
         )
     else:
@@ -375,8 +408,7 @@ if __name__ == "__main__":
             gold_cc_agent_run_dataset(
                 sonnet_name=args.sonnet_name,
                 haiku_name=args.haiku_name,
-                dataset_path=args.dataset_path,
                 output_dir=args.output_dir,
-                max_step=args.max_step,
+                config=config,
             )
         )

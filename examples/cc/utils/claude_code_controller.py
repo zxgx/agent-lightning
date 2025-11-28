@@ -1,37 +1,33 @@
-import os
 from functools import partial
+import json
 from typing import Literal
 
 import dotenv
 from utils.docker_runtime import Runtime
 from utils.logger import logger
+from utils.type import CC_ALL_TOOLS as all_tools, AgentResult
 
 
 class ClaudeController:
-    system_prompt = """
- You are an expert software engineer solving swebench bug fixing tasks.
-"""
-    user_prompt = """
-You are given a code repository in the current directory (/testbed).
-The bug description is:
-{description}
-=================================================
-You task is to fix the bug with the following steps:
-(1) write test cases to reproduce the bug.
-(2) explore the source codes to locate the bug.
-(3) edit the source codes to fix the bug.
-(4) rerun your written test cases to validate that the bug is fixed. If not, go back to explore the source codes and fix the codes again.
-(5) remember to delete the test cases you write at last.
-Please do not commit your edits. We will do it later.
-"""
-
-    def __init__(self, image: str, instance: dict, run_id: str, endpoint: str, api_key: str) -> None:
+    system_prompt = """You are an expert software engineer solving swebench bug fixing tasks."""
+    def __init__(self, 
+                 image: str, 
+                 instance: dict, 
+                 run_id: str, 
+                 tools: set,
+                 user_prompt: str,
+                 endpoint: str, 
+                 api_key: str) -> None:
         self.image = image
         self.instance = instance
         self.run_id = run_id
         self.endpoint = endpoint
         self.api_key = api_key
         self.container: Runtime = self.init_container(self.image, self.instance)
+        self.allowed_tools: str = ",".join([f'"{i}"' for i in tools])
+        self.disallowed_tools: str = ",".join([f'"{i}"' for i in (all_tools - tools)])
+        assert "{description}" in user_prompt
+        self.user_prompt: str = user_prompt
         return
 
     def init_container(self, image: str, instance: dict) -> Runtime:
@@ -53,7 +49,7 @@ Please do not commit your edits. We will do it later.
         container.send_command("export IS_SANDBOX=1")
         return container
 
-    def _run_cli(self, instance: dict, max_step: int, timelimit: int):
+    def _run_cli(self, instance: dict, max_step: int, timelimit: int) -> list[dict]:
         # prepare prompt safely: write it to a file inside the container using a single-quoted heredoc
         # directly applying prompt for heredoc may raise error for windows line ending \r\n
         prompt_text = self.user_prompt.format(description=instance["problem_statement"].replace('"""', "'''"))
@@ -61,11 +57,14 @@ Please do not commit your edits. We will do it later.
         heredoc_cmd = "cat > /tmp/cc_prompt.txt <<'CC_PROMPT'\n" + prompt_text + "\nCC_PROMPT\n"
         self.container.send_command(heredoc_cmd)
 
-        # self.container.send_command("mkdir -p /testbed/.claude")
-        # with open("utils/settings.template.json") as f:
-        #     setting = f.read()
-        # setting_cmd = "cat > /testbed/.claude/settings.json <<'CC_SETTING'\n" + setting + "\nCC_SETTING\n"
-        # self.container.send_command(setting_cmd)
+        self.container.send_command("mkdir -p /testbed/.claude")
+        with open("utils/settings.template.json") as f:
+            setting = f.read()
+        setting = (setting
+                    .replace("<allowedTools>", self.allowed_tools)
+                    .replace("<excludedTools>", self.disallowed_tools))
+        setting_cmd = "cat > /testbed/.claude/settings.json <<'CC_SETTING'\n" + setting + "\nCC_SETTING\n"
+        self.container.send_command(setting_cmd)
 
         # with open("utils/handle_hook.template.sh") as f:
         #     handler = f.read()
@@ -74,12 +73,15 @@ Please do not commit your edits. We will do it later.
         # self.container.send_command("chmod +x /tmp/handle_hook.sh")
 
         # run claude reading the prompt from the file to avoid shell interpolation issues
-        claude_cmd = f'claude -p "$(cat /tmp/cc_prompt.txt)" --append-system-prompt "{self.system_prompt}" --max-turns {max_step} --dangerously-skip-permissions --output-format json --verbose'
-        self.container.send_command(claude_cmd, timelimit * 60)
+        claude_cmd = f'claude -p "$(cat /tmp/cc_prompt.txt)" --append-system-prompt "{self.system_prompt}" --max-turns {max_step}  --output-format json --verbose'
+        res = self.container.send_command(claude_cmd, timelimit * 60)
+        traj = [i for i in res.output.splitlines() if "session_id" in i]
+        assert len(traj) > 0, "traj not found!"
+        traj = json.loads(traj[0])
         # self.container.send_command("cat /tmp/hook.out")
-        return
+        return traj
 
-    def _run_python_sdk(self, instance: dict, max_step: int, timelimit: int):
+    def _run_python_sdk(self, instance: dict, max_step: int, timelimit: int) -> list[dict]:
         self.container.send_command(
             f"""
 if ! command -v python3 &> /dev/null; then
@@ -102,22 +104,25 @@ fi
 
     def run_instance(
         self, instance: dict, max_step: int = 40, timelimit: int = 30, run_method: Literal["python", "cli"] = "python"
-    ) -> dict:
+    ) -> AgentResult:
         """
         timelimit: in minute
         """
         if run_method == "python":
-            self._run_python_sdk(instance, max_step, timelimit)
+            raise NotImplementedError("Claude Code Python SDK has not been fully implemented...")
+            # traj = self._run_python_sdk(instance, max_step, timelimit)
         elif run_method == "cli":
-            self._run_cli(instance, max_step, timelimit)
+            traj = self._run_cli(instance, max_step, timelimit)
         else:
             raise ValueError(f"wrong run_method {run_method}, run_method should be in [python, cli]")
+        self.container.send_command("rm -rf /testbed/.claude")
         result = self.container.send_command("git --no-pager diff HEAD")
         git_diff = result.output.replace("git --no-pager diff HEAD\n", "")
         return {
             "instance_id": instance["instance_id"],
             "model_patch": git_diff,
             "model_name_or_path": "cc",
+            "trajectory": traj
         }
 
     def __del__(self):
