@@ -18,12 +18,12 @@ CC_ALL_TOOLS = {
 
 class DatasetConfig(TypedDict):
     dataset_dir: str
-    namespace: str
-    full_set: str
+    namespace: Literal["swebench", "starryzhang"]
+    full_set: Literal["princeton-nlp/SWE-bench", "SWE-bench-Live/SWE-bench-Live"]
     split: str
 
 class CCConfig(TypedDict):
-    tools: str
+    tools: list[str]
     user_prompt: str
 
 class RumtimeConfig(TypedDict):

@@ -115,6 +115,7 @@ fi
             traj = self._run_cli(instance, max_step, timelimit)
         else:
             raise ValueError(f"wrong run_method {run_method}, run_method should be in [python, cli]")
+        self.container.send_command("rm -rf /testbed/.claude")
         result = self.container.send_command("git --no-pager diff HEAD")
         git_diff = result.output.replace("git --no-pager diff HEAD\n", "")
         return {

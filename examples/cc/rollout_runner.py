@@ -12,11 +12,12 @@ from rich.console import Console
 from agentlightning import LitAgentRunner, configure_logger
 from agentlightning.store import LightningStore, LightningStoreClient
 from agentlightning.tracer import OtelTracer
+from examples.cc.utils.type import AgentConfig
 
 console = Console()
 
 
-def run_rollout(*, store: LightningStore, config: dict, worker_id: int) -> None:
+def run_rollout(*, store: LightningStore, config: AgentConfig, worker_id: int) -> None:
     tracer = OtelTracer()
     runner = LitAgentRunner[Dict[str, Any]](tracer)
 
@@ -36,7 +37,7 @@ def run_rollout(*, store: LightningStore, config: dict, worker_id: int) -> None:
         asyncio.run(runner.iter())
 
 
-def spawn_runners(*, store: LightningStore, config: dict) -> None:
+def spawn_runners(*, store: LightningStore, config: AgentConfig) -> None:
     runners = [
         multiprocessing.Process(
             target=run_rollout, kwargs={"store": store, "config": config, "worker_id": worker_id}
