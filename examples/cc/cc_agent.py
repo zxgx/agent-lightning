@@ -61,7 +61,6 @@ class CodingAgent(LitAgent):
         force_rebuild: bool = False,
         timeout: int = 1_800,  # in sec
         instance_image_tag: str = "latest",
-        rewrite_reports: bool = False,
     ) -> None:
         super().__init__()
         self.namespace = namespace
@@ -75,7 +74,6 @@ class CodingAgent(LitAgent):
         self.force_rebuild = force_rebuild
         self.timeout = timeout
         self.instance_image_tag = instance_image_tag
-        self.rewrite_reports = rewrite_reports
 
         full_dataset = load_swebench_dataset(full_set, split)
         self.dataset = {each["instance_id"]: each for each in full_dataset}
@@ -133,8 +131,7 @@ class CodingAgent(LitAgent):
             run_id,
             self.timeout,
             namespace=self.namespace,
-            instance_image_tag=self.instance_image_tag,
-            rewrite_reports=self.rewrite_reports,
+            instance_image_tag=self.instance_image_tag
         )
 
         # error patch

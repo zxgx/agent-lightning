@@ -64,7 +64,6 @@ def run_instance(
     client: docker.DockerClient,
     run_id: str,
     timeout: int | None = None,
-    rewrite_reports: bool = False,
 ):
     """
     Run a single instance with the given prediction.
@@ -227,7 +226,6 @@ def evaluate(
     timeout,
     namespace,
     instance_image_tag,
-    rewrite_reports,
 ):
     client = docker.from_env()
     test_spec = make_test_spec(instance, namespace=namespace, instance_image_tag=instance_image_tag)
@@ -245,7 +243,6 @@ def evaluate(
         client,
         run_id,
         timeout,
-        rewrite_reports,
     )
 
 

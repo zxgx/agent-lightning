@@ -30,13 +30,9 @@ class CCConfig(TypedDict):
 
 
 class RumtimeConfig(TypedDict):
-    epochs: int
     max_step: int
     workers: int
-    num_samples: int
-    run_id: str
     run_method: Literal["cli", "python"]
-    overwrite: bool
 
 
 class AgentConfig(TypedDict):
