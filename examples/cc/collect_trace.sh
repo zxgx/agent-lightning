@@ -75,7 +75,7 @@ $secondary_dp_option
 
 # Make the code below iterable, for EPOCH in range($num_samples):
 for EPOCH in $(seq 0 $((num_samples - 1))); do
-    model_id="${dataset_path}_${model_tag}/sample${EPOCH}"
+    model_id="${model_tag}/${dataset_path}/sample${EPOCH}"
 
     python parallel_trace_collection.py \
         --access_host localhost \

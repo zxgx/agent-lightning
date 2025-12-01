@@ -3,9 +3,10 @@ import json
 from typing import Literal
 
 import dotenv
+from examples.cc.utils.reward import RewardEstimator
 from utils.docker_runtime import Runtime
 from utils.logger import logger
-from utils.type import CC_ALL_TOOLS as all_tools, AgentResult
+from utils.type import CC_ALL_TOOLS as all_tools, AgentResult, ClaudeCodeTraj
 
 
 class ClaudeController:
@@ -49,7 +50,7 @@ class ClaudeController:
         container.send_command("export IS_SANDBOX=1")
         return container
 
-    def _run_cli(self, instance: dict, max_step: int, timelimit: int) -> list[dict]:
+    def _run_cli(self, instance: dict, max_step: int, timelimit: int) -> ClaudeCodeTraj:
         # prepare prompt safely: write it to a file inside the container using a single-quoted heredoc
         # directly applying prompt for heredoc may raise error for windows line ending \r\n
         prompt_text = self.user_prompt.format(description=instance["problem_statement"].replace('"""', "'''"))
@@ -77,7 +78,7 @@ class ClaudeController:
         res = self.container.send_command(claude_cmd, timelimit * 60)
         traj = [i for i in res.output.splitlines() if "session_id" in i]
         assert len(traj) > 0, "traj not found!"
-        traj = json.loads(traj[0])
+        traj: ClaudeCodeTraj = json.loads(traj[0])
         # self.container.send_command("cat /tmp/hook.out")
         return traj
 
@@ -115,15 +116,17 @@ fi
             traj = self._run_cli(instance, max_step, timelimit)
         else:
             raise ValueError(f"wrong run_method {run_method}, run_method should be in [python, cli]")
-        self.container.send_command("rm -rf /testbed/.claude")
-        result = self.container.send_command("git --no-pager diff HEAD")
-        git_diff = result.output.replace("git --no-pager diff HEAD\n", "")
-        return {
+        solution_patch = self.container.send_command("git --no-pager diff HEAD --diff-filter=M --text").output
+        solution_patch = solution_patch.replace("git --no-pager diff HEAD --diff-filter=M --text\n", "")
+        reproduction_file = self.container.send_command("cat /testbed/reproduction.py").output
+        reproduction_file = reproduction_file.replace("cat /testbed/reproduction.py\n", "")
+        return_value: AgentResult = {
             "instance_id": instance["instance_id"],
-            "model_patch": git_diff,
+            "model_patch": solution_patch,
             "model_name_or_path": "cc",
             "trajectory": traj
         }
+        return return_value
 
     def __del__(self):
         if hasattr(self, "container"):

@@ -46,16 +46,16 @@ class SWEbenchInput(TypedDict):
     model_name_or_path: str
 
 class TextContent(TypedDict):
-    type = "text"
+    type: Literal["text"]
     text: str
 
 class ToolCallContent(TypedDict):
-    type = "tool_use"
+    type: Literal["tool_use"]
     name: str
-    input: dict
+    input: dict[str, str]
 
 class ToolResultContent(TypedDict):
-    type = "tool_result"
+    type: Literal["tool_result"]
     content: str
     is_error: bool
 
@@ -67,20 +67,20 @@ class ClaudeCodeStep(TypedDict):
     type: str
     message: ClaudeCodeMessage
 
-# SliceType = Literal["Localization", "Reproduction", "Edit", "Validation", "Result"]
+SliceType = Literal["Localization", "Reproduction", "Edit", "Validation", "Result"]
 
 ClaudeCodeTraj = list[ClaudeCodeStep]
 
 class AgentResult(SWEbenchInput):
     trajectory: ClaudeCodeTraj
 
-# class TrajSlice(TypedDict):
-#     process: SliceType
-#     step_range: tuple[int, int]
-#     content: ClaudeCodeTraj
+class TrajSlice(TypedDict):
+    process: SliceType
+    step_range: tuple[int, int]
+    content: ClaudeCodeTraj
 
 
-# class RewardReturnType(TypedDict):
-#     traj: TrajSlice
-#     keysteps: ClaudeCodeTraj
-#     reward: float # [-1.0 , 1.0] in practice
+class RewardReturnType(TypedDict):
+    traj: TrajSlice
+    keysteps: ClaudeCodeTraj
+    reward: float # [-1.0 , 1.0] in practice
