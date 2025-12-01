@@ -1,23 +1,20 @@
-from functools import partial
 import json
+from functools import partial
 from typing import Literal
 
 import dotenv
 from utils.docker_runtime import Runtime
 from utils.logger import logger
-from utils.type import CC_ALL_TOOLS as all_tools, AgentResult
+from utils.type import CC_ALL_TOOLS as all_tools
+from utils.type import AgentResult
 
 
 class ClaudeController:
     system_prompt = """You are an expert software engineer solving swebench bug fixing tasks."""
-    def __init__(self, 
-                 image: str, 
-                 instance: dict, 
-                 run_id: str, 
-                 tools: set,
-                 user_prompt: str,
-                 endpoint: str, 
-                 api_key: str) -> None:
+
+    def __init__(
+        self, image: str, instance: dict, run_id: str, tools: set, user_prompt: str, endpoint: str, api_key: str
+    ) -> None:
         self.image = image
         self.instance = instance
         self.run_id = run_id
@@ -60,9 +57,9 @@ class ClaudeController:
         self.container.send_command("mkdir -p /testbed/.claude")
         with open("utils/settings.template.json") as f:
             setting = f.read()
-        setting = (setting
-                    .replace("<allowedTools>", self.allowed_tools)
-                    .replace("<excludedTools>", self.disallowed_tools))
+        setting = setting.replace("<allowedTools>", self.allowed_tools).replace(
+            "<excludedTools>", self.disallowed_tools
+        )
         setting_cmd = "cat > /testbed/.claude/settings.json <<'CC_SETTING'\n" + setting + "\nCC_SETTING\n"
         self.container.send_command(setting_cmd)
 
@@ -115,15 +112,17 @@ fi
             traj = self._run_cli(instance, max_step, timelimit)
         else:
             raise ValueError(f"wrong run_method {run_method}, run_method should be in [python, cli]")
-        self.container.send_command("rm -rf /testbed/.claude")
-        result = self.container.send_command("git --no-pager diff HEAD")
-        git_diff = result.output.replace("git --no-pager diff HEAD\n", "")
-        return {
+        solution_patch = self.container.send_command("git --no-pager diff HEAD --diff-filter=M --text").output
+        solution_patch = solution_patch.replace("git --no-pager diff HEAD --diff-filter=M --text\n", "")
+        reproduction_file = self.container.send_command("cat /testbed/reproduction.py").output
+        reproduction_file = reproduction_file.replace("cat /testbed/reproduction.py\n", "")
+        return_value: AgentResult = {
             "instance_id": instance["instance_id"],
-            "model_patch": git_diff,
+            "model_patch": solution_patch,
             "model_name_or_path": "cc",
-            "trajectory": traj
+            "trajectory": traj,
         }
+        return return_value
 
     def __del__(self):
         if hasattr(self, "container"):

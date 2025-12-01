@@ -17,6 +17,7 @@ async def run_parallel_trace_collection(
     llm_proxy: str,
     store,
     task_dataset,
+    num_repeats: int,
     data_adapter,
     tokenizer,
     epoch,
@@ -32,6 +33,7 @@ async def run_parallel_trace_collection(
         llm_proxy=llm_proxy,
         store=store,
         task_dataset=task_dataset,
+        num_repeats=num_repeats,
         enable_lora=epoch > 0,
     )
 
@@ -78,6 +80,7 @@ if __name__ == "__main__":
         default=0.8,
     )
     parser.add_argument("--dataset_path", type=str, default="swe_debug.jsonl")
+    parser.add_argument("--num_repeats", type=int, default=1, help="Number of repeats.")
     parser.add_argument(
         "--dataset_dump_path", type=str, default="datasets", help="If not None, dump the dataset to disk."
     )
@@ -104,6 +107,7 @@ if __name__ == "__main__":
             llm_proxy=llm_proxy,
             store=store,
             task_dataset=task_dataset,
+            num_repeats=args.num_repeats,
             data_adapter=data_adapter,
             tokenizer=tokenizer,
             epoch=1 if args.enable_lora else 0,
