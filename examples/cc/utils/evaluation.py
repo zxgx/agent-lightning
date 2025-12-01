@@ -1,5 +1,6 @@
 import json
 import platform
+import shutil
 import traceback
 from argparse import ArgumentParser
 from pathlib import Path, PurePosixPath
@@ -85,22 +86,9 @@ def run_instance(
 
     # Set up report file
     report_path = log_dir / LOG_REPORT
-    if rewrite_reports:
-        test_output_path = log_dir / LOG_TEST_OUTPUT
-        if not test_output_path.exists():
-            raise ValueError(f"Test output file {test_output_path} does not exist")
-        report = get_eval_report(
-            test_spec=test_spec,
-            prediction=pred,
-            test_log_path=test_output_path,
-            include_tests_status=True,
-        )
-        # Write report to report.json
-        with open(report_path, "w") as f:
-            f.write(json.dumps(report, indent=4))
-        return instance_id, report
-    if report_path.exists():
-        return instance_id, json.loads(report_path.read_text())
+
+    if log_dir.exists():
+        shutil.rmtree(log_dir)
 
     if not test_spec.is_remote_image:
         # Link the image build dir in the log dir
