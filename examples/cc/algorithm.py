@@ -103,6 +103,7 @@ async def run_rollout(
     llm_proxy: LLMProxy,
     store: LightningStore,
     task_dataset: Any,
+    num_repeats: int = 1,
     enable_lora: bool = False,
 ) -> List[Rollout]:
     """Rollout to get trace data"""
@@ -131,10 +132,11 @@ async def run_rollout(
         resources_update = await store.add_resources({"llm": llm_proxy.as_resource(model="local")})
 
         rollouts: List[Rollout] = []
-        for data in task_dataset:
-            rollouts.append(
-                await store.enqueue_rollout(input=data, mode="train", resources_id=resources_update.resources_id)
-            )
+        for _ in range(num_repeats):
+            for data in task_dataset:
+                rollouts.append(
+                    await store.enqueue_rollout(input=data, mode="train", resources_id=resources_update.resources_id)
+                )
 
         console.print(f"[bold red][Algo][/bold red] Enqueued {len(rollouts)} rollouts")
 
@@ -154,6 +156,7 @@ async def run_rollout(
             )
             await asyncio.sleep(5.0)
 
+        await llm_proxy.stop()
         return completed_rollouts
 
 
@@ -177,7 +180,7 @@ async def build_dataset(
 
     for rollout in completed_rollouts:
         # Use data_adapter to adapt the spans to triplets. Triplets are a list of Pydantic models:
-        spans = await store.query_spans(rollout.rollout_id, "latest")
+        spans = await store.query_spans(rollout.rollout_id)
         triplets = data_adapter.adapt(spans)
 
         # Logging the prompt and response lengths and rewards for debugging
@@ -221,7 +224,9 @@ async def build_dataset(
             )
 
         if spand_dump_epoch_path:
-            span_file_path = os.path.join(spand_dump_epoch_path, f"{rollout.input['instance_id']}.json")
+            span_file_path = os.path.join(
+                spand_dump_epoch_path, f"{rollout.input['instance_id']}-{rollout.rollout_id}.json"
+            )
             with open(span_file_path, "w") as f:
                 for span in spans:
                     f.write(json.dumps(span.model_dump()) + "\n")
@@ -283,6 +288,7 @@ async def run_epoch(
     tokenizer: AutoTokenizer,
     vllm_serve_args_str: str,
     task_dataset: Any,
+    num_repeats: int,
     llm_proxy: LLMProxy,
     data_adapter: LlmProxyTraceToTriplet,
     train_triplet_fraction: float,
@@ -299,6 +305,7 @@ async def run_epoch(
         llm_proxy=llm_proxy,
         store=store,
         task_dataset=task_dataset,
+        num_repeats=num_repeats,
         enable_lora=epoch > 0,
     )
 
@@ -326,6 +333,7 @@ async def run_algorithm(
     model_path: str,
     vllm_serve_args_str: str,
     num_epochs: int,
+    num_repeats: int,
     train_triplet_fraction: float,
     dataset_path: str,
     dataset_dump_path: str,
@@ -354,6 +362,7 @@ async def run_algorithm(
             tokenizer=tokenizer,  # type: ignore
             vllm_serve_args_str=vllm_serve_args_str,
             task_dataset=task_dataset,
+            num_repeats=num_repeats,
             llm_proxy=llm_proxy,
             data_adapter=data_adapter,
             train_triplet_fraction=train_triplet_fraction,
@@ -387,6 +396,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--proxy_port", type=int, default=8765, help="The port for the LLM proxy server.")
     parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs.")
+    parser.add_argument("--num_repeats", type=int, default=1, help="Number of repeats.")
     parser.add_argument(
         "--train_triplet_fraction",
         type=float,
@@ -409,6 +419,7 @@ if __name__ == "__main__":
             model_path=args.model_name_or_path,
             vllm_serve_args_str=args.vllm_serve_args_str,
             num_epochs=args.num_epochs,
+            num_repeats=args.num_repeats,
             train_triplet_fraction=args.train_triplet_fraction,
             dataset_path=args.dataset_path,
             dataset_dump_path=args.dataset_dump_path,

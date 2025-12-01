@@ -1,9 +1,11 @@
 import asyncio
-import json, yaml
+import json
 import os
 import platform
 import time
 from typing import Any, Dict, List, Literal, Optional
+
+import yaml
 
 if platform.system() == "Linux":
     import resource
@@ -13,7 +15,7 @@ from swebench.harness.utils import load_swebench_dataset
 from transformers import AutoTokenizer as AutoProcessor
 from utils.claude_code_controller import ClaudeController
 from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
-from utils.custom_callbacks import AddLogprobs
+from utils.custom_callbacks import AddLogprobs, AddTemperature
 from utils.evaluation import evaluate
 from utils.logger import logger
 from utils.type import AgentResult
@@ -51,7 +53,7 @@ class CodingAgent(LitAgent):
         split: str = "test",
         max_step: int = 5,
         run_method: Literal["python", "cli"] = "cli",
-        tools: list[str] = ["Glob","Grep","Bash","Read","Edit","Write","TodoWrite","WebFetch","ExitPlanMode"],
+        tools: list[str] = ["Glob", "Grep", "Bash", "Read", "Edit", "Write", "TodoWrite", "WebFetch", "ExitPlanMode"],
         user_prompt: str = "{description}",
         open_file_limit: int = 4096,
         cache_level: str = "env",  # ["none", "base", "env", "instance"]
@@ -99,12 +101,12 @@ class CodingAgent(LitAgent):
         try:
             # 1. init container
             controller = ClaudeController(
-                image, 
-                task, 
-                run_id, 
+                image,
+                task,
+                run_id,
                 set(self.tools),
                 self.user_prompt,
-                llm.endpoint, 
+                llm.endpoint,
                 llm.api_key or os.environ.get("ANTHROPIC_AUTH_TOKEN", "dummy"),
             )
             # 2. execute task
@@ -198,7 +200,12 @@ def flatten_messages(messages: List[Any]) -> List[Dict[str, str]]:
 
 
 async def cc_agent_dry_run_sample(
-    model_path, server_address, sonnet_name, haiku_name, output_dir, config,
+    model_path,
+    server_address,
+    sonnet_name,
+    haiku_name,
+    output_dir,
+    config,
 ) -> None:
     """Run a dry run of the cc agent on a single sample.
 
@@ -215,7 +222,9 @@ async def cc_agent_dry_run_sample(
     runner = LitAgentRunner(tracer)
     adapter = LlmProxyTraceToAugmentedTriplet()
     store = LightningStoreServer(InMemoryLightningStore(), host="0.0.0.0", port=7654)
-    llm_proxy = LLMProxy(port=12358, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs])
+    llm_proxy = LLMProxy(
+        port=12358, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs, AddTemperature]
+    )
 
     await store.start()
 
@@ -253,9 +262,9 @@ async def cc_agent_dry_run_sample(
         max_step=config["runtime"]["max_step"],
         run_method=config["runtime"]["run_method"],
         tools=config["agent"]["tools"],
-        user_prompt=config["agent"]["user_prompt"]
+        user_prompt=config["agent"]["user_prompt"],
     )
-    
+
     with runner.run_context(agent=agent, store=store):
         rollout = await runner.step(
             dataset[0],
@@ -265,7 +274,9 @@ async def cc_agent_dry_run_sample(
         triplets = adapter.adapt(spans)
         logging.info(f"dump {len(spans)} spans, extract {len(triplets)} triplets")
         if output_dir is not None:
-            with open(os.path.join(output_dir, f"stream_{dataset[0]['instance_id']}.json"), "w") as f:
+            with open(
+                os.path.join(output_dir, f"stream_{dataset[0]['instance_id']}-{rollout.attempt.attempt_id}.json"), "w"
+            ) as f:
                 for span in spans:
                     f.write(json.dumps(span.model_dump()) + "\n")
 
@@ -294,6 +305,8 @@ async def cc_agent_dry_run_sample(
             ds.save_to_disk(os.path.join(output_dir, f"dataset-{dataset[0]['instance_id']}"))
             logging.info(f"Saved dataset with {len(ds)} samples to dataset-{dataset[0]['instance_id']}")
 
+    await llm_proxy.stop()
+
 
 async def gold_cc_agent_run_dataset(
     sonnet_name,
@@ -313,7 +326,13 @@ async def gold_cc_agent_run_dataset(
     tracer = OtelTracer()
     runner = LitAgentRunner(tracer)
     store = LightningStoreServer(InMemoryLightningStore(), host="0.0.0.0", port=7654)
-    llm_proxy = LLMProxy(port=12358, store=store)
+    llm_proxy = LLMProxy(
+        port=12358,
+        store=store,
+        callbacks=[
+            "opentelemetry",
+        ],
+    )
 
     await store.start()
 
@@ -346,7 +365,7 @@ async def gold_cc_agent_run_dataset(
             max_step=config["runtime"]["max_step"],
             run_method=config["runtime"]["run_method"],
             tools=config["agent"]["tools"],
-            user_prompt=config["agent"]["user_prompt"]
+            user_prompt=config["agent"]["user_prompt"],
         )
         with runner.run_context(agent=agent, store=store):
             rollout = await runner.step(each)

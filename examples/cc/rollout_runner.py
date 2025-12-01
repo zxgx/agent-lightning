@@ -1,12 +1,8 @@
-import time
-import yaml
-import os
-import shutil
-
 import asyncio
 import multiprocessing
 from typing import Any, Dict
 
+import yaml
 from cc_agent import CodingAgent
 from rich.console import Console
 
@@ -31,7 +27,7 @@ def run_rollout(*, store: LightningStore, config: AgentConfig, worker_id: int) -
         max_step=config["runtime"]["max_step"],
         run_method=config["runtime"]["run_method"],
         tools=config["agent"]["tools"],
-        user_prompt=config["agent"]["user_prompt"]
+        user_prompt=config["agent"]["user_prompt"],
     )
 
     with runner.run_context(agent=agent, store=store, worker_id=worker_id):
@@ -40,9 +36,7 @@ def run_rollout(*, store: LightningStore, config: AgentConfig, worker_id: int) -
 
 def spawn_runners(*, store: LightningStore, config: AgentConfig) -> None:
     runners = [
-        multiprocessing.Process(
-            target=run_rollout, kwargs={"store": store, "config": config, "worker_id": worker_id}
-        )
+        multiprocessing.Process(target=run_rollout, kwargs={"store": store, "config": config, "worker_id": worker_id})
         for worker_id in range(config["runtime"]["workers"])
     ]
     for runner in runners:
@@ -60,21 +54,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--store_address", type=str, default="http://localhost:4747", help="The address of the LightningStore server."
     )
-    parser.add_argument("--agent_config", type=str, default="agent_config.yaml", help="Agent config to run Claude Code.")
+    parser.add_argument(
+        "--agent_config", type=str, default="agent_config.yaml", help="Agent config to run Claude Code."
+    )
 
     args = parser.parse_args()
 
     with open(args.agent_config) as f:
         config = yaml.safe_load(f)
 
-    for sample in range(config["runtime"]["num_samples"]):
-        console.print(f"Start Sampling No.{sample}")
-        store = LightningStoreClient(args.store_address)
-        spawn_runners(store=store, config=config)
-        
-        # Move logs to sample-specific directory
-        logs_dir = "logs"
-        target_dir = f"logs_sample_{sample}"
-        shutil.move(logs_dir, target_dir)
-        time.sleep(10)
-        assert not os.path.exists(logs_dir)
+
+    store = LightningStoreClient(args.store_address)
+    spawn_runners(store=store, config=config)
+

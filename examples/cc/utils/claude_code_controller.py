@@ -1,5 +1,5 @@
-from functools import partial
 import json
+from functools import partial
 from typing import Literal
 
 import dotenv
@@ -11,14 +11,10 @@ from utils.type import CC_ALL_TOOLS as all_tools, AgentResult, ClaudeCodeTraj
 
 class ClaudeController:
     system_prompt = """You are an expert software engineer solving swebench bug fixing tasks."""
-    def __init__(self, 
-                 image: str, 
-                 instance: dict, 
-                 run_id: str, 
-                 tools: set,
-                 user_prompt: str,
-                 endpoint: str, 
-                 api_key: str) -> None:
+
+    def __init__(
+        self, image: str, instance: dict, run_id: str, tools: set, user_prompt: str, endpoint: str, api_key: str
+    ) -> None:
         self.image = image
         self.instance = instance
         self.run_id = run_id
@@ -61,9 +57,9 @@ class ClaudeController:
         self.container.send_command("mkdir -p /testbed/.claude")
         with open("utils/settings.template.json") as f:
             setting = f.read()
-        setting = (setting
-                    .replace("<allowedTools>", self.allowed_tools)
-                    .replace("<excludedTools>", self.disallowed_tools))
+        setting = setting.replace("<allowedTools>", self.allowed_tools).replace(
+            "<excludedTools>", self.disallowed_tools
+        )
         setting_cmd = "cat > /testbed/.claude/settings.json <<'CC_SETTING'\n" + setting + "\nCC_SETTING\n"
         self.container.send_command(setting_cmd)
 
@@ -124,7 +120,7 @@ fi
             "instance_id": instance["instance_id"],
             "model_patch": solution_patch,
             "model_name_or_path": "cc",
-            "trajectory": traj
+            "trajectory": traj,
         }
         return return_value
 

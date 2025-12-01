@@ -16,7 +16,7 @@ agent:
     - WebFetch
     - ExitPlanMode
 
-  user_prompt: |-
+  user_prompt: |-  # multiline string
     You are given a code repository in the current directory (/testbed).
     The bug description is:
     {description}
