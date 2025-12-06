@@ -3,10 +3,10 @@ from functools import partial
 from typing import Literal
 
 import dotenv
-from examples.cc.utils.reward import RewardEstimator
+from examples.cc.utils.reward import RewardEstimator, RewardEstimatorWholeSlice
 from utils.docker_runtime import Runtime
 from utils.logger import logger
-from utils.type import CC_ALL_TOOLS as all_tools, AgentResult, ClaudeCodeTraj
+from utils.type import CC_ALL_TOOLS as all_tools, AgentResult, ClaudeCodeStep, ClaudeCodeTraj
 
 
 class ClaudeController:
@@ -70,7 +70,7 @@ class ClaudeController:
         # self.container.send_command("chmod +x /tmp/handle_hook.sh")
 
         # run claude reading the prompt from the file to avoid shell interpolation issues
-        claude_cmd = f'claude -p "$(cat /tmp/cc_prompt.txt)" --append-system-prompt "{self.system_prompt}" --max-turns {max_step}  --output-format json --verbose'
+        claude_cmd = f'claude -p "$(cat /tmp/cc_prompt.txt)" --system-prompt "{self.system_prompt}" --max-turns {max_step}  --output-format json --verbose'
         res = self.container.send_command(claude_cmd, timelimit * 60)
         traj = [i for i in res.output.splitlines() if "session_id" in i]
         assert len(traj) > 0, "traj not found!"
@@ -119,10 +119,22 @@ fi
         return_value: AgentResult = {
             "instance_id": instance["instance_id"],
             "model_patch": solution_patch,
+            "reproduction_file": reproduction_file,
             "model_name_or_path": "cc",
             "trajectory": traj,
         }
         return return_value
+    
+    def calculate_intermediate_rewards_per_slice(self, 
+                                       gold_patch: str,
+                                       model_patch: str, 
+                                       reproduction_file: str, 
+                                       trajectory: ClaudeCodeTraj) -> list[tuple[ClaudeCodeStep, float]]:
+        reward_estimator: RewardEstimatorWholeSlice = RewardEstimatorWholeSlice(self.container,
+                                                                                reproduction_file,
+                                                                                model_patch, 
+                                                                                gold_patch)
+        return reward_estimator.main(trajectory)
 
     def __del__(self):
         if hasattr(self, "container"):

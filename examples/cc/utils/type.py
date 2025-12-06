@@ -1,4 +1,4 @@
-from typing import Literal, TypedDict
+from typing import Any, Literal, Optional, TypedDict
 
 CC_ALL_TOOLS = {
     "Bash",
@@ -55,7 +55,7 @@ class TextContent(TypedDict):
 class ToolCallContent(TypedDict):
     type: Literal["tool_use"]
     name: str
-    input: dict[str, str]
+    input: dict[str, Any]
 
 
 class ToolResultContent(TypedDict):
@@ -72,22 +72,20 @@ class ClaudeCodeMessage(TypedDict):
 class ClaudeCodeStep(TypedDict):
     type: str
     message: ClaudeCodeMessage
+    parent_tool_use_id: Optional[str | None]
 
-SliceType = Literal["Localization", "Reproduction", "Edit", "Validation", "Result"]
+
+SliceType = Literal["Localization", "Reproduction", "Edit", "Validation", "Result", "InvalidToolCall"]
 
 ClaudeCodeTraj = list[ClaudeCodeStep]
 
 
 class AgentResult(SWEbenchInput):
     trajectory: ClaudeCodeTraj
+    reproduction_file: str
 
 class TrajSlice(TypedDict):
     process: SliceType
     step_range: tuple[int, int]
     content: ClaudeCodeTraj
 
-
-class RewardReturnType(TypedDict):
-    traj: TrajSlice
-    keysteps: ClaudeCodeTraj
-    reward: float # [-1.0 , 1.0] in practice
