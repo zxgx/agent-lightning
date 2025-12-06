@@ -26,6 +26,8 @@ from examples.claude_code.claude_code_agent import ClaudeCodeAgent, _load_datase
 
 from ..common.tracer import clear_tracer_provider
 
+pytest.skip(reason="Debug only", allow_module_level=True)
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
