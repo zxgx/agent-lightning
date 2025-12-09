@@ -32,7 +32,7 @@ export HF_HOME=$HOME/.cache/huggingface
 # Make it able to receive named cmd args, --model_tag, --tool_call_parser, --num_samples
 model_tag=Qwen/Qwen3-4B-Instruct-2507
 tool_call_parser=hermes
-num_samples=1
+num_repeats=2
 dataset_path=swe_debug.jsonl
 
 # Parse command line arguments
@@ -46,8 +46,8 @@ while [[ $# -gt 0 ]]; do
             tool_call_parser="$2"
             shift 2
             ;;
-        --num_samples)
-            num_samples="$2"
+        --num_repeats)
+            num_repeats="$2"
             shift 2
             ;;
         --dataset_path)
@@ -74,16 +74,15 @@ $secondary_dp_option
 "
 
 # Make the code below iterable, for EPOCH in range($num_samples):
-for EPOCH in $(seq 0 $((num_samples - 1))); do
-    model_id="${model_tag}_sample${EPOCH}"
 
-    python parallel_trace_collection.py \
-        --access_host localhost \
-        --model_name_or_path $model_tag \
-        --vllm_serve_args_str "--enable-auto-tool-choice --tool-call-parser $tool_call_parser $parallel_config" \
-        --dataset_path $dataset_path \
-        --dataset_dump_path /mnt/input/agl_trace/$model_id/datasets \
-        --span_dump_path /mnt/input/agl_trace/$model_id/spans 2>&1 | tee /mnt/input/agl_trace/collect_${model_id}.log
-    
-    sleep 60
-done
+model_id="${model_tag}/${dataset_path}/sample${num_repeats}"
+
+python parallel_trace_collection.py \
+    --access_host localhost \
+    --model_name_or_path $model_tag \
+    --vllm_serve_args_str "--enable-auto-tool-choice --tool-call-parser $tool_call_parser $parallel_config" \
+    --dataset_path $dataset_path \
+    --num_repeats $num_repeats\
+    --dataset_dump_path /mnt/input/agl_trace/$model_id/datasets \
+    --span_dump_path /mnt/input/agl_trace/$model_id/spans 2>&1 | tee /mnt/input/agl_trace/collect_${model_id}.log
+

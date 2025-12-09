@@ -157,7 +157,7 @@ class CommandResult:
     """
 
     output: str
-    metadata: Optional[CmdOutputMetadata]
+    metadata: CmdOutputMetadata
 
     def to_observation(self, strip: bool = True) -> str:
         """

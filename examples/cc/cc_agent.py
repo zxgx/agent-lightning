@@ -18,7 +18,7 @@ from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
 from utils.custom_callbacks import AddLogprobs, AddTemperature
 from utils.evaluation import evaluate
 from utils.logger import logger
-from utils.type import AgentResult
+from utils.type import AgentResult, ClaudeCodeStep
 
 from agentlightning import (
     InMemoryLightningStore,
@@ -61,7 +61,6 @@ class CodingAgent(LitAgent):
         force_rebuild: bool = False,
         timeout: int = 1_800,  # in sec
         instance_image_tag: str = "latest",
-        rewrite_reports: bool = False,
     ) -> None:
         super().__init__()
         self.namespace = namespace
@@ -75,7 +74,6 @@ class CodingAgent(LitAgent):
         self.force_rebuild = force_rebuild
         self.timeout = timeout
         self.instance_image_tag = instance_image_tag
-        self.rewrite_reports = rewrite_reports
 
         full_dataset = load_swebench_dataset(full_set, split)
         self.dataset = {each["instance_id"]: each for each in full_dataset}
@@ -112,6 +110,8 @@ class CodingAgent(LitAgent):
             # 2. execute task
             prediction: AgentResult = controller.run_instance(task, max_step=self.max_step, run_method=self.run_method)
             logger(run_id, task["instance_id"], json.dumps(prediction, indent=4))
+            # Under development: Intermediate Reward
+            # intermediate_reward_list: list[tuple[ClaudeCodeStep, float]] = controller.calculate_intermediate_rewards_per_slice(task["patch"],  prediction["model_patch"], prediction["reproduction_file"], prediction["trajectory"])
             del controller
         except Exception as e:
             logger(run_id, task["instance_id"], f"Exception during rollout: {e}")
@@ -133,8 +133,7 @@ class CodingAgent(LitAgent):
             run_id,
             self.timeout,
             namespace=self.namespace,
-            instance_image_tag=self.instance_image_tag,
-            rewrite_reports=self.rewrite_reports,
+            instance_image_tag=self.instance_image_tag
         )
 
         # error patch

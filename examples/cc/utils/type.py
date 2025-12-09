@@ -1,4 +1,4 @@
-from typing import Literal, TypedDict
+from typing import Any, Literal, Optional, TypedDict
 
 CC_ALL_TOOLS = {
     "Bash",
@@ -30,13 +30,9 @@ class CCConfig(TypedDict):
 
 
 class RumtimeConfig(TypedDict):
-    epochs: int
     max_step: int
     workers: int
-    num_samples: int
-    run_id: str
     run_method: Literal["cli", "python"]
-    overwrite: bool
 
 
 class AgentConfig(TypedDict):
@@ -52,18 +48,18 @@ class SWEbenchInput(TypedDict):
 
 
 class TextContent(TypedDict):
-    type = "text"
+    type: Literal["text"]
     text: str
 
 
 class ToolCallContent(TypedDict):
-    type = "tool_use"
+    type: Literal["tool_use"]
     name: str
-    input: dict
+    input: dict[str, Any]
 
 
 class ToolResultContent(TypedDict):
-    type = "tool_result"
+    type: Literal["tool_result"]
     content: str
     is_error: bool
 
@@ -76,24 +72,20 @@ class ClaudeCodeMessage(TypedDict):
 class ClaudeCodeStep(TypedDict):
     type: str
     message: ClaudeCodeMessage
+    parent_tool_use_id: Optional[str | None]
 
 
-# SliceType = Literal["Localization", "Reproduction", "Edit", "Validation", "Result"]
+SliceType = Literal["Localization", "Reproduction", "Edit", "Validation", "Result", "InvalidToolCall"]
 
 ClaudeCodeTraj = list[ClaudeCodeStep]
 
 
 class AgentResult(SWEbenchInput):
     trajectory: ClaudeCodeTraj
+    reproduction_file: str
 
+class TrajSlice(TypedDict):
+    process: SliceType
+    step_range: tuple[int, int]
+    content: ClaudeCodeTraj
 
-# class TrajSlice(TypedDict):
-#     process: SliceType
-#     step_range: tuple[int, int]
-#     content: ClaudeCodeTraj
-
-
-# class RewardReturnType(TypedDict):
-#     traj: TrajSlice
-#     keysteps: ClaudeCodeTraj
-#     reward: float # [-1.0 , 1.0] in practice

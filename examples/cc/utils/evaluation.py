@@ -1,5 +1,6 @@
 import json
 import platform
+import shutil
 import traceback
 from argparse import ArgumentParser
 from pathlib import Path, PurePosixPath
@@ -63,7 +64,6 @@ def run_instance(
     client: docker.DockerClient,
     run_id: str,
     timeout: int | None = None,
-    rewrite_reports: bool = False,
 ):
     """
     Run a single instance with the given prediction.
@@ -85,22 +85,9 @@ def run_instance(
 
     # Set up report file
     report_path = log_dir / LOG_REPORT
-    if rewrite_reports:
-        test_output_path = log_dir / LOG_TEST_OUTPUT
-        if not test_output_path.exists():
-            raise ValueError(f"Test output file {test_output_path} does not exist")
-        report = get_eval_report(
-            test_spec=test_spec,
-            prediction=pred,
-            test_log_path=test_output_path,
-            include_tests_status=True,
-        )
-        # Write report to report.json
-        with open(report_path, "w") as f:
-            f.write(json.dumps(report, indent=4))
-        return instance_id, report
-    if report_path.exists():
-        return instance_id, json.loads(report_path.read_text())
+
+    if log_dir.exists():
+        shutil.rmtree(log_dir)
 
     if not test_spec.is_remote_image:
         # Link the image build dir in the log dir
@@ -239,7 +226,6 @@ def evaluate(
     timeout,
     namespace,
     instance_image_tag,
-    rewrite_reports,
 ):
     client = docker.from_env()
     test_spec = make_test_spec(instance, namespace=namespace, instance_image_tag=instance_image_tag)
@@ -257,7 +243,6 @@ def evaluate(
         client,
         run_id,
         timeout,
-        rewrite_reports,
     )
 
 
