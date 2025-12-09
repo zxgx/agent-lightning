@@ -37,12 +37,14 @@ jobs:
           uv sync --frozen \
             --extra apo \
             --extra verl \
+            --extra mongo \
             --group dev \
             --group torch-cpu \
             --group torch-stable \
             --group trl \
             --group tinker \
             --group agents \
+            --group langchain \
             --no-default-groups
         if: matrix.setup == 'slow'
       # This pre-commit skips JavaScript on purpose.
@@ -138,10 +140,10 @@ jobs:
         run: uv lock --upgrade
         if: matrix.setup-script == 'latest'
       - name: Sync dependencies (latest)
-        run: uv sync --frozen --no-default-groups --extra apo --group dev --group agents --group core-stable
+        run: uv sync --frozen --no-default-groups --extra apo --group dev --group agents --group langchain --group core-stable
         if: matrix.setup-script == 'latest'
       - name: Sync dependencies (stable & legacy)
-        run: uv sync --frozen --no-default-groups --extra apo --group dev --group agents --group core-${{ matrix.setup-script }}
+        run: uv sync --frozen --no-default-groups --extra apo --group dev --group agents --group langchain --group core-${{ matrix.setup-script }}
         if: matrix.setup-script != 'latest'
       - name: Freeze dependencies
         run: |
@@ -166,7 +168,7 @@ jobs:
 
       - name: Run tests
         run: |
-          uv run pytest -v --durations=0 tests
+          uv run pytest -v --durations=0 tests -m "not mongo"
         env:
           PYTEST_ADDOPTS: "--color=yes"
 

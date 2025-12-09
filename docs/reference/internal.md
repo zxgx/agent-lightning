@@ -4,6 +4,8 @@
 
     The following APIs should be used with extra caution because they are very likely to change in the future.
 
+## Algorithms and Adapters
+
 ::: agentlightning.adapter.messages.OpenAIMessages
 
 ::: agentlightning.adapter.triplet.TraceTree
@@ -14,11 +16,17 @@
 
 ::: agentlightning.algorithm.decorator.FunctionalAlgorithm
 
+## LitAgent
+
 ::: agentlightning.litagent.decorator.FunctionalLitAgent
 
 ::: agentlightning.litagent.decorator.llm_rollout
 
 ::: agentlightning.litagent.decorator.prompt_rollout
+
+::: agentlightning.emitter.annotation.OperationContext
+
+## LLM Proxy
 
 ::: agentlightning.llm_proxy.ModelConfig
 
@@ -34,11 +42,33 @@
 
 ::: agentlightning.llm_proxy.RolloutAttemptMiddleware
 
+## Store
+
 ::: agentlightning.store.base.UNSET
 
-::: agentlightning.store.utils.propagate_status
+::: agentlightning.store.utils.rollout_status_from_attempt
 
-::: agentlightning.tracer.agentops.LightningSpanProcessor
+::: agentlightning.store.utils.scan_unhealthy_rollouts
+
+## Tracing and OpenTelemetry
+
+::: agentlightning.tracer.otel.LightningSpanProcessor
+
+## Utilities
+
+::: agentlightning.utils.metrics.MetricsBackend
+
+::: agentlightning.utils.metrics.ConsoleMetricsBackend
+
+::: agentlightning.utils.metrics.PrometheusMetricsBackend
+
+::: agentlightning.utils.metrics.MultiMetricsBackend
+
+::: agentlightning.utils.metrics.setup_multiprocess_prometheus
+
+::: agentlightning.utils.metrics.get_prometheus_registry
+
+::: agentlightning.utils.metrics.shutdown_metrics
 
 ::: agentlightning.utils.server_launcher.PythonServerLauncher
 
@@ -46,7 +76,37 @@
 
 ::: agentlightning.utils.server_launcher.LaunchMode
 
+::: agentlightning.utils.otel.full_qualified_name
+
+::: agentlightning.utils.otel.get_tracer_provider
+
+::: agentlightning.utils.otel.get_tracer
+
+::: agentlightning.utils.otel.make_tag_attributes
+
+::: agentlightning.utils.otel.extract_tags_from_attributes
+
+::: agentlightning.utils.otel.make_link_attributes
+
+::: agentlightning.utils.otel.query_linked_spans
+
+::: agentlightning.utils.otel.extract_links_from_attributes
+
+::: agentlightning.utils.otel.filter_attributes
+
+::: agentlightning.utils.otel.filter_and_unflatten_attributes
+
+::: agentlightning.utils.otel.flatten_attributes
+
+::: agentlightning.utils.otel.unflatten_attributes
+
+::: agentlightning.utils.otlp.handle_otlp_export
+
+::: agentlightning.utils.otlp.spans_from_proto
+
 ## Deprecated APIs
+
+::: agentlightning.emitter.reward.reward
 
 ::: agentlightning.server.AgentLightningServer
 

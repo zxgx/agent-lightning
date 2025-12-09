@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, Sequence, TypedDict
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, TypedDict
 
 from opentelemetry.sdk.trace import ReadableSpan
 
@@ -10,14 +10,17 @@ from agentlightning.types import (
     Attempt,
     AttemptedRollout,
     AttemptStatus,
+    EnqueueRolloutRequest,
     NamedResources,
     ResourcesUpdate,
     Rollout,
     RolloutConfig,
+    RolloutMode,
     RolloutStatus,
     Span,
     TaskInput,
     Worker,
+    WorkerStatus,
 )
 
 
@@ -53,8 +56,11 @@ UNSET = _UnsetType()
 Unset = _UnsetType  # Alias for convenience
 
 
-class LightningStoreCapabilities(TypedDict):
-    """Capability of a LightningStore implementation."""
+class LightningStoreCapabilities(TypedDict, total=False):
+    """Capability of a LightningStore implementation.
+
+    All keys are optional and false by default.
+    """
 
     thread_safe: bool
     """Whether the store is thread-safe."""
@@ -62,6 +68,37 @@ class LightningStoreCapabilities(TypedDict):
     """Whether the store is async-safe."""
     zero_copy: bool
     """Whether the store has only one copy across all threads/processes."""
+    otlp_traces: bool
+    """Whether the store supports OTLP/HTTP traces."""
+
+
+class LightningStoreStatistics(TypedDict, total=False):
+    """Statistics of a LightningStore implementation."""
+
+    name: str
+    """Name of the store implementation."""
+    total_rollouts: int
+    """Total number of rollouts in the store."""
+    total_attempts: int
+    """Total number of attempts in the store."""
+    total_spans: int
+    """Total number of spans in the store."""
+    total_resources: int
+    """Total number of resources in the store."""
+    total_workers: int
+    """Total number of workers in the store."""
+    uptime: float
+    """Uptime of since the store has been started."""
+
+    # Memory-related statistics
+    total_span_bytes: int
+    """Total number of bytes of spans in the store."""
+    eviction_threshold_bytes: int
+    """Eviction threshold for spans in bytes."""
+    safe_threshold_bytes: int
+    """Safe threshold for spans in bytes."""
+    memory_capacity_bytes: int
+    """Memory capacity of the store in bytes."""
 
 
 class LightningStore:
@@ -86,21 +123,46 @@ class LightningStore:
     Unless stated otherwise, missing identifiers should result in a `ValueError`.
     """
 
+    @property
     def capabilities(self) -> LightningStoreCapabilities:
         """Return the capabilities of the store."""
         return LightningStoreCapabilities(
             thread_safe=False,
             async_safe=False,
             zero_copy=False,
+            otlp_traces=False,
         )
+
+    async def statistics(self) -> LightningStoreStatistics:
+        """Return the statistics of the store."""
+        return {
+            "name": self.__class__.__name__,
+        }
+
+    def otlp_traces_endpoint(self) -> str:
+        """Return the OTLP/HTTP traces endpoint of the store.
+
+        The traces can have rollout ID and attempt ID (and optionally sequence ID)
+        saved in the "resource" of the spans.
+        The store, if it supports OTLP, should be able to receive the traces and save them
+        via [`add_span`][agentlightning.LightningStore.add_span] or
+        [`add_otel_span`][agentlightning.LightningStore.add_otel_span].
+
+        The endpoint should be compatible with [OTLP HTTP protocol](https://opentelemetry.io/docs/specs/otlp/).
+        It's not necessarily compatible with OTLP gRPC protocol.
+
+        The returned endpoint will usually ends with `/v1/traces`.
+        """
+        raise NotImplementedError()
 
     async def start_rollout(
         self,
         input: TaskInput,
-        mode: Literal["train", "val", "test"] | None = None,
+        mode: RolloutMode | None = None,
         resources_id: str | None = None,
         config: RolloutConfig | None = None,
         metadata: Dict[str, Any] | None = None,
+        worker_id: str | None = None,
     ) -> AttemptedRollout:
         """Register a rollout and immediately create its first attempt.
 
@@ -123,6 +185,7 @@ class LightningStore:
             resources_id: Concrete resource snapshot to execute against; defaults to the latest stored snapshot.
             config: Rollout retry/timeout policy. Should default to a fresh [`RolloutConfig`][agentlightning.RolloutConfig].
             metadata: Free-form metadata persisted verbatim with the rollout.
+            worker_id: Optional worker identifier to associate the new attempt with.
 
         Returns:
             The fully-populated [`AttemptedRollout`][agentlightning.AttemptedRollout] including
@@ -168,6 +231,22 @@ class LightningStore:
         """
         raise NotImplementedError()
 
+    async def enqueue_many_rollouts(self, rollouts: Sequence[EnqueueRolloutRequest]) -> Sequence[Rollout]:
+        """Persist multiple rollouts in `queuing` state.
+
+        The implementation can delegate to [`enqueue_rollout()`][agentlightning.LightningStore.enqueue_rollout]
+        per request and preserves the input ordering. Subclasses can override to provide
+        more efficient bulk enqueue semantics.
+
+        Args:
+            rollouts: Rollout submission payloads mirroring [`enqueue_rollout()`][agentlightning.LightningStore.enqueue_rollout]'s
+                parameters. Each entry requires `input` and can optionally include other fields.
+
+        Returns:
+            Rollouts enqueued in the same order as `rollouts`.
+        """
+        raise NotImplementedError()
+
     async def dequeue_rollout(self, worker_id: Optional[str] = None) -> Optional[AttemptedRollout]:
         """Claim the oldest queued rollout and transition it to `preparing`.
 
@@ -184,6 +263,9 @@ class LightningStore:
         * Optionally refresh the caller's [`Worker`][agentlightning.Worker] telemetry
           (e.g., `last_dequeue_time`) when `worker_id` is provided.
 
+        Args:
+            worker_id: Optional worker identifier to associate the claimed attempt with.
+
         Returns:
             The next attempt to execute, or `None` when no eligible rollouts are queued.
 
@@ -192,7 +274,30 @@ class LightningStore:
         """
         raise NotImplementedError()
 
-    async def start_attempt(self, rollout_id: str) -> AttemptedRollout:
+    async def dequeue_many_rollouts(
+        self,
+        *,
+        limit: int = 1,
+        worker_id: Optional[str] = None,
+    ) -> Sequence[AttemptedRollout]:
+        """Claim up to `limit` queued rollouts without blocking.
+
+        The implementation can repeatedly invokes
+        [`dequeue_rollout()`][agentlightning.LightningStore.dequeue_rollout] until reaching
+        the requested limit or the queue is empty. Subclasses can override it to fetch
+        multiple rollouts atomically.
+
+        Args:
+            limit: Maximum number of rollouts to claim. Non-positive values return an empty list.
+            worker_id: Optional worker identifier passed through to each dequeue call.
+
+        Returns:
+            Attempted rollouts claimed in FIFO order. May contain fewer than `limit` entries
+            when the queue is exhausted.
+        """
+        raise NotImplementedError()
+
+    async def start_attempt(self, rollout_id: str, worker_id: Optional[str] = None) -> AttemptedRollout:
         """Create a manual retry attempt for an existing rollout.
 
         This is typically invoked by runners that wish to retry outside of the
@@ -203,6 +308,7 @@ class LightningStore:
 
         Args:
             rollout_id: Unique identifier of the rollout receiving a new attempt.
+            worker_id: Optional worker identifier to associate the new attempt with.
 
         Returns:
             The rollout paired with its newly-created attempt.
@@ -213,7 +319,15 @@ class LightningStore:
         """
         raise NotImplementedError()
 
-    async def add_span(self, span: Span) -> Span:
+    async def add_many_spans(self, spans: Sequence[Span]) -> Sequence[Span]:
+        """Persist a sequence of pre-constructed spans emitted during rollout execution.
+
+        Implementations can simply delegate to [`add_span()`][agentlightning.LightningStore.add_span] for each span.
+        However, if the store supports bulk insertion, it can implement this method to improve performance.
+        """
+        raise NotImplementedError()
+
+    async def add_span(self, span: Span) -> Optional[Span]:
         """Persist a pre-constructed span emitted during rollout execution.
 
         The provided [`Span`][agentlightning.Span] must already contain the `rollout_id`,
@@ -230,6 +344,7 @@ class LightningStore:
 
         Returns:
             The stored span record (implementations may return a copy).
+            Return `None` if the span was not added due to a duplicate.
 
         Raises:
             NotImplementedError: Subclasses must implement span persistence.
@@ -243,7 +358,7 @@ class LightningStore:
         attempt_id: str,
         readable_span: ReadableSpan,
         sequence_id: int | None = None,
-    ) -> Span:
+    ) -> Optional[Span]:
         """Convert and persist an OpenTelemetry span for a particular attempt.
 
         Implementations must transform the `readable_span` into a [`Span`][agentlightning.Span]
@@ -260,7 +375,7 @@ class LightningStore:
                 automatically.
 
         Returns:
-            The stored span record.
+            The stored span record. Return `None` if the span was not added due to a duplicate.
 
         Raises:
             NotImplementedError: Subclasses must implement span persistence.
@@ -269,30 +384,77 @@ class LightningStore:
         raise NotImplementedError()
 
     async def query_rollouts(
-        self, *, status: Optional[Sequence[RolloutStatus]] = None, rollout_ids: Optional[Sequence[str]] = None
-    ) -> List[Rollout]:
+        self,
+        *,
+        status_in: Optional[Sequence[RolloutStatus]] = None,
+        rollout_id_in: Optional[Sequence[str]] = None,
+        rollout_id_contains: Optional[str] = None,
+        filter_logic: Literal["and", "or"] = "and",
+        sort_by: Optional[str] = None,
+        sort_order: Literal["asc", "desc"] = "asc",
+        limit: int = -1,
+        offset: int = 0,
+        # Deprecated fields
+        status: Optional[Sequence[RolloutStatus]] = None,
+        rollout_ids: Optional[Sequence[str]] = None,
+    ) -> Sequence[Rollout]:
         """Retrieve rollouts filtered by status and/or explicit identifiers.
 
+        This interface supports structured filtering, sorting, and pagination so
+        callers can build simple dashboards without copying data out of the
+        store. The legacy parameters `status` and `rollout_ids` remain valid and
+        are treated as aliases for `status_in` and `rollout_id_in`
+        respectively—when both the new and deprecated parameters are supplied
+        the new parameters take precedence.
+
         Args:
-            status: Optional whitelist of [`RolloutStatus`][agentlightning.RolloutStatus] values.
-            rollout_ids: Optional whitelist of rollout identifiers to include.
+            status_in: Optional whitelist of [`RolloutStatus`][agentlightning.RolloutStatus] values.
+            rollout_id_in: Optional whitelist of rollout identifiers to include.
+            rollout_id_contains: Optional substring match for rollout identifiers.
+            filter_logic: Logical operator to combine filters.
+            sort_by: Optional field to sort by. Must reference a numeric or string
+                field on [`Rollout`][agentlightning.Rollout].
+            sort_order: Direction to sort when `sort_by` is provided.
+            limit: Maximum number of rows to return. Use `-1` for "no limit".
+            offset: Number of rows to skip before returning results.
+            status: Deprecated field. Use `status_in` instead.
+            rollout_ids: Deprecated field. Use `rollout_id_in` instead.
 
         Returns:
-            A list of matching rollouts. Ordering is backend-defined but must be deterministic.
+            A sequence of matching rollouts (or [`AttemptedRollout`][agentlightning.AttemptedRollout]
+            when attempts exist). Ordering is deterministic when `sort_by` is set.
+            The return value is not guaranteed to be a list.
 
         Raises:
             NotImplementedError: Subclasses must implement the query.
         """
         raise NotImplementedError()
 
-    async def query_attempts(self, rollout_id: str) -> List[Attempt]:
+    async def query_attempts(
+        self,
+        rollout_id: str,
+        *,
+        sort_by: Optional[str] = "sequence_id",
+        sort_order: Literal["asc", "desc"] = "asc",
+        limit: int = -1,
+        offset: int = 0,
+    ) -> Sequence[Attempt]:
         """Return every attempt ever created for `rollout_id` in ascending sequence order.
+
+        The parameters allow callers to re-order or paginate the attempts so that
+        large retry histories can be streamed lazily.
 
         Args:
             rollout_id: Identifier of the rollout being inspected.
+            sort_by: Field to sort by. Must be a numeric or string field of
+                [`Attempt`][agentlightning.Attempt]. Defaults to `sequence_id` (oldest first).
+            sort_order: Order to sort by.
+            limit: Limit on the number of results. `-1` for unlimited.
+            offset: Offset into the results.
 
         Returns:
-            Attempts sorted by `sequence_id` (oldest first). Returns an empty list when none exist.
+            Sequence of Attempts. Returns an empty sequence when none exist.
+            The return value is not guaranteed to be a list.
 
         Raises:
             NotImplementedError: Subclasses must implement the query.
@@ -329,11 +491,35 @@ class LightningStore:
         """
         raise NotImplementedError()
 
-    async def query_resources(self) -> List[ResourcesUpdate]:
+    async def query_resources(
+        self,
+        *,
+        resources_id: Optional[str] = None,
+        resources_id_contains: Optional[str] = None,
+        # Filter logic is not supported here because I can't see why it's needed.
+        sort_by: Optional[str] = None,
+        sort_order: Literal["asc", "desc"] = "asc",
+        limit: int = -1,
+        offset: int = 0,
+    ) -> Sequence[ResourcesUpdate]:
         """List every stored resource snapshot in insertion order.
 
+        Supports lightweight filtering, sorting, and pagination for embedding in
+        dashboards.
+
+        Args:
+            resources_id: Optional identifier of the resources to include.
+            resources_id_contains: Optional substring match for resources identifiers.
+            sort_by: Optional field to sort by (must be numeric or string on
+                [`ResourcesUpdate`][agentlightning.ResourcesUpdate]).
+            sort_order: Order to sort by.
+            limit: Limit on the number of results. `-1` for unlimited.
+            offset: Offset into the results.
+
         Returns:
-            A chronological list of [`ResourcesUpdate`][agentlightning.ResourcesUpdate] objects.
+            [`ResourcesUpdate`][agentlightning.ResourcesUpdate] objects.
+            By default, resources are sorted in a deterministic but undefined order.
+            The return value is not guaranteed to be a list.
 
         Raises:
             NotImplementedError: Subclasses must implement retrieval.
@@ -390,6 +576,20 @@ class LightningStore:
         """
         raise NotImplementedError()
 
+    async def get_many_span_sequence_ids(self, rollout_attempt_ids: Sequence[Tuple[str, str]]) -> Sequence[int]:
+        """Bulk allocate the next strictly increasing sequence number used to order spans.
+
+        Implementations may delegate to [`get_next_span_sequence_id()`][agentlightning.LightningStore.get_next_span_sequence_id]
+        for each rollout and attempt.
+
+        Args:
+            rollout_attempt_ids: List of tuples of rollout and attempt identifiers.
+
+        Returns:
+            List of sequence numbers.
+        """
+        raise NotImplementedError()
+
     async def wait_for_rollouts(self, *, rollout_ids: List[str], timeout: Optional[float] = None) -> List[Rollout]:
         """Block until the targeted rollouts reach a terminal status or the timeout expires.
 
@@ -416,19 +616,61 @@ class LightningStore:
         """
         raise NotImplementedError()
 
-    async def query_spans(self, rollout_id: str, attempt_id: str | Literal["latest"] | None = None) -> List[Span]:
+    async def query_spans(
+        self,
+        rollout_id: str,
+        attempt_id: str | Literal["latest"] | None = None,
+        *,
+        # Filtering
+        trace_id: Optional[str] = None,
+        trace_id_contains: Optional[str] = None,
+        span_id: Optional[str] = None,
+        span_id_contains: Optional[str] = None,
+        parent_id: Optional[str] = None,
+        parent_id_contains: Optional[str] = None,
+        name: Optional[str] = None,
+        name_contains: Optional[str] = None,
+        filter_logic: Literal["and", "or"] = "and",
+        # Pagination
+        limit: int = -1,
+        offset: int = 0,
+        # Sorting
+        sort_by: Optional[str] = "sequence_id",
+        sort_order: Literal["asc", "desc"] = "asc",
+    ) -> Sequence[Span]:
         """Return the stored spans for a rollout, optionally scoped to one attempt.
 
-        Spans must be returned in ascending `sequence_id` order. Implementations may raise
-        a `RuntimeError` when spans were evicted or expired.
+        Supports a handful of filters that cover the most common debugging
+        scenarios (matching `trace_id`/`span_id`/`parent_id` or substring
+        matches on the span name). `attempt_id="latest"` acts as a convenience
+        that resolves the most recent attempt before evaluating filters. When
+        `attempt_id=None`, spans across every attempt are eligible. By default
+        results are sorted by `sequence_id` (oldest first). Implementations may
+        raise a `RuntimeError` when spans were evicted or expired.
 
         Args:
             rollout_id: Identifier of the rollout being inspected.
             attempt_id: Attempt identifier to filter by. Pass `"latest"` to retrieve only the
                 most recent attempt, or `None` to return all spans across attempts.
+            trace_id: Optional trace ID to filter by.
+            trace_id_contains: Optional substring match for trace IDs.
+            span_id: Optional span ID to filter by.
+            span_id_contains: Optional substring match for span IDs.
+            parent_id: Optional parent span ID to filter by.
+            parent_id_contains: Optional substring match for parent span IDs.
+            name: Optional span name to filter by.
+            name_contains: Optional substring match for span names.
+            filter_logic: Logical operator to combine the optional filters above.
+                The `rollout_id` argument is always applied with AND semantics.
+            limit: Limit on the number of results. `-1` for unlimited.
+            offset: Offset into the results.
+            sort_by: Field to sort by. Must be a numeric or string field of
+                [`Span`][agentlightning.Span].
+            sort_order: Order to sort by.
 
         Returns:
             An ordered list of spans (possibly empty).
+            The return value is not guaranteed to be a list.
 
         Raises:
             NotImplementedError: Subclasses must implement the query.
@@ -524,7 +766,8 @@ class LightningStore:
 
         When `attempt_id` is `"latest"` the update must target the attempt with the highest
         `sequence_id`; otherwise it must target the specific attempt. Implementations should
-        propagate status changes to the rollout (for example via [`propagate_status()`][agentlightning.store.utils.propagate_status])
+        propagate status changes to the rollout (for example
+        via [`rollout_status_from_attempt()`][agentlightning.store.utils.rollout_status_from_attempt])
         once the latest attempt transitions to a terminal state.
 
         Similar to [`update_rollout()`][agentlightning.LightningStore.update_rollout],
@@ -555,11 +798,29 @@ class LightningStore:
 
     async def query_workers(
         self,
-    ) -> List[Worker]:
+        *,
+        status_in: Optional[Sequence[WorkerStatus]] = None,
+        worker_id_contains: Optional[str] = None,
+        filter_logic: Literal["and", "or"] = "and",
+        sort_by: Optional[str] = None,
+        sort_order: Literal["asc", "desc"] = "asc",
+        limit: int = -1,
+        offset: int = 0,
+    ) -> Sequence[Worker]:
         """Query all workers in the system.
 
+        Args:
+            status_in: Optional whitelist of [`WorkerStatus`][agentlightning.WorkerStatus] values.
+            worker_id_contains: Optional substring match for worker identifiers.
+            filter_logic: Logical operator to combine the optional filters above.
+            sort_by: Field to sort by. Must be a numeric or string field of [`Worker`][agentlightning.Worker].
+            sort_order: Order to sort by.
+            limit: Limit on the number of results. `-1` for unlimited.
+            offset: Offset into the results.
+
         Returns:
-            A list of all workers.
+            Sequence of Workers. Returns an empty sequence when none exist.
+            The return value is not guaranteed to be a list.
         """
         raise NotImplementedError()
 

@@ -30,7 +30,7 @@ import socket
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import agentops
@@ -39,6 +39,7 @@ import httpx
 import litellm
 import openai
 import pytest
+import requests
 import uvicorn
 from agents import Agent, AgentHooks, GuardrailFunctionOutput, InputGuardrail, RunConfig, Runner, function_tool
 from agents.mcp import MCPServerStdio
@@ -49,17 +50,6 @@ from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_ext.tools.mcp import McpWorkbench, StdioServerParams
 from fastapi import FastAPI
-from langchain import hub
-from langchain.agents import AgentExecutor, create_react_agent, tool
-from langchain.chat_models import init_chat_model
-from langchain_community.agent_toolkits import SQLDatabaseToolkit
-from langchain_community.utilities import SQLDatabase
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode
 from openai import AsyncOpenAI, OpenAI
 from opentelemetry.sdk.trace import ReadableSpan
 from pydantic import BaseModel, Field
@@ -73,26 +63,39 @@ from agentlightning.types import Span, Triplet
 
 from ..common.tracer import clear_agentops_init, clear_tracer_provider
 
+try:
+    import langchain
+
+    LANGCHAIN_INSTALLED = True
+except ImportError:
+    LANGCHAIN_INSTALLED = False
+
+if TYPE_CHECKING or LANGCHAIN_INSTALLED:
+    from langchain.agents import create_agent
+    from langchain.chat_models import init_chat_model
+    from langchain_community.agent_toolkits import SQLDatabaseToolkit
+    from langchain_community.utilities import SQLDatabase
+    from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.tools import tool
+    from langchain_openai import ChatOpenAI
+    from langgraph.graph import END, START, MessagesState, StateGraph
+
 USE_OPENAI = os.environ.get("USE_OPENAI", "false").lower() == "true"
+OPENAI_BASE_URL = "http://127.0.0.1:58000/v1"
+OPENAI_MODEL = "gpt-4.1-mini"
+OPENAI_API_KEY = "token-abc123"
+
+REAL_OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+REAL_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if USE_OPENAI:
-    OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", os.environ["OPENAI_API_BASE"])
-    OPENAI_MODEL = "gpt-4.1-mini"
-    OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-else:
-    OPENAI_BASE_URL = "http://127.0.0.1:58000/v1"
-    OPENAI_MODEL = "gpt-4.1-mini"
-    OPENAI_API_KEY = "token-abc123"
+    assert (
+        REAL_OPENAI_BASE_URL is not None and REAL_OPENAI_API_KEY is not None
+    ), "OPENAI_BASE_URL and OPENAI_API_KEY must be set when USE_OPENAI is true"
 
 
 _langchain_callback_handler = None
-
-
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: List[Dict[str, Any]]
-    stream: bool = False
-    tools: Optional[List[Any]] = None
-    tool_choice: Optional[Any] = None
 
 
 class MockOpenAICompatibleServer:
@@ -113,8 +116,11 @@ class MockOpenAICompatibleServer:
         self.prompt_caches = self._load_prompt_caches()
         self._setup_routes()
 
+    def _prompt_cache_path(self) -> str:
+        return os.path.join(os.path.dirname(__file__), "../assets/prompt_caches.jsonl")
+
     def _load_prompt_caches(self):
-        cache_path = os.path.join(os.path.dirname(__file__), "../assets/prompt_caches.jsonl")
+        cache_path = self._prompt_cache_path()
         caches = []
         if os.path.exists(cache_path):
             with open(cache_path, "r") as f:
@@ -158,10 +164,23 @@ class MockOpenAICompatibleServer:
 
     def _setup_routes(self):
         @self.app.post("/v1/chat/completions")
-        def chat_completions(request: ChatCompletionRequest):
+        def chat_completions(request: Dict[str, Any]):
+            if USE_OPENAI:
+                # Call Real OpenAI API to get prompt cache
+                response = requests.post(
+                    REAL_OPENAI_BASE_URL.rstrip("/") + "/chat/completions",
+                    json=request,
+                    headers={"Authorization": f"Bearer {REAL_OPENAI_API_KEY}"},
+                )
+                if response.status_code != 200:
+                    raise ValueError(f"Failed to call OpenAI API: {response.status_code} {response.text}")
+                response_dict = response.json()
+                with open(self._prompt_cache_path(), "a") as f:
+                    f.write(json.dumps({"request": request, "response": response_dict}) + "\n")
+                return response_dict
+
             # Try to find the best match in prompt caches
-            request_dict = request.model_dump()
-            cached_response, score = self._find_best_cache_match(request_dict)
+            cached_response, score = self._find_best_cache_match(request)
             if cached_response and score > 0.8:
                 time.sleep(0.1)  # Simulate network delay
                 # Return the cached response directly
@@ -290,13 +309,16 @@ def agent_langchain_tooluse() -> None:
         disable_streaming=True,
     )
     tools = [multiply]
-    agent = create_react_agent(llm, tools, hub.pull("hwchase17/react"))
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=False)
-    result = agent_executor.invoke(
-        {"input": "what is 42 * 12"},
+    agent = create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt="You are a helpful assistant. Use the multiply tool to answer math questions.",
+    )
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": "what is 42 * 12"}]},
         {"callbacks": [_langchain_callback_handler]} if _langchain_callback_handler else None,
     )
-    assert "504" in result["output"]
+    assert "504" in result["messages"][-1].content
 
 
 def agent_langgraph() -> None:
@@ -310,10 +332,25 @@ def agent_langgraph() -> None:
         return next(t for t in tools if t.name == name)
 
     get_schema_tool = next(tool for tool in tools if tool.name == "sql_db_schema")
-    get_schema_node = ToolNode([get_schema_tool], name="get_schema")
-
     run_query_tool = next(tool for tool in tools if tool.name == "sql_db_query")
-    run_query_node = ToolNode([run_query_tool], name="run_query")
+
+    def get_schema(state: MessagesState):
+        """Execute the get_schema tool based on the last message's tool calls."""
+        last_message = state["messages"][-1]
+        tool_messages = []
+        for tool_call in getattr(last_message, "tool_calls", []):
+            result = get_schema_tool.invoke(tool_call)
+            tool_messages.append(result)
+        return {"messages": tool_messages}
+
+    def run_query(state: MessagesState):
+        """Execute the run_query tool based on the last message's tool calls."""
+        last_message = state["messages"][-1]
+        tool_messages = []
+        for tool_call in getattr(last_message, "tool_calls", []):
+            result = run_query_tool.invoke(tool_call)
+            tool_messages.append(result)
+        return {"messages": tool_messages}
 
     def list_tables(state: MessagesState):
         tool_call = {
@@ -370,10 +407,10 @@ def agent_langgraph() -> None:
     builder = StateGraph(MessagesState)
     builder.add_node(list_tables)
     builder.add_node(call_get_schema)
-    builder.add_node(get_schema_node, "get_schema")
+    builder.add_node(get_schema)
     builder.add_node(generate_query)
     builder.add_node(check_query)
-    builder.add_node(run_query_node, "run_query")
+    builder.add_node(run_query)
     builder.add_edge(START, "list_tables")
     builder.add_edge("list_tables", "call_get_schema")
     builder.add_edge("call_get_schema", "get_schema")
@@ -781,38 +818,13 @@ def run_with_http_tracer() -> None:
     tracer.teardown()
 
 
-def create_prompt_caches() -> None:
-    """Create prompt caches for the agent frameworks.
-    This should only be run once to populate the caches.
-    """
-
-    if USE_OPENAI:
-        tracer = HttpTracer()
-        with tracer._trace_context_sync():
-            run_all()
-
-        with open(os.path.join(os.path.dirname(__file__), "../assets/prompt_caches.jsonl"), "w") as f:
-            for span in tracer._last_records.requests.values():
-                if span.url.startswith(OPENAI_BASE_URL) and span.status_code < 400 and span.response.content:
-                    f.write(
-                        json.dumps(
-                            {
-                                "request": json.loads(span.request.content.decode()),
-                                "response": json.loads(span.response.content.decode()),
-                            }
-                        )
-                        + "\n"
-                    )
-
-    else:
-        run_all()
-
-
 @pytest.mark.parametrize("agent_func_name", [f.__name__ for f in iterate_over_agents()], ids=str)
 def test_run_with_agentops_tracer(agent_func_name: str):
     """AgentOps tracer tests are notoriously problematic and does not work well with other tests."""
     if agent_func_name in ["openai_agents_sdk_mcp_tool_use", "agent_autogen_mcp"]:
         pytest.skip("Async MCP server is problematic with AgentOps tracer in multiprocessing mode.")
+    if ("langchain" in agent_func_name or "langgraph" in agent_func_name) and not LANGCHAIN_INSTALLED:
+        pytest.skip("LangChain is not installed. Skip langchain related tests.")
 
     ctx = multiprocessing.get_context("spawn")
     proc = ctx.Process(target=_test_run_with_agentops_tracer_impl, args=(agent_func_name,))
@@ -840,7 +852,9 @@ def _test_run_with_agentops_tracer_impl(agent_func_name: str):
     tracer.init_worker(0)
 
     global _langchain_callback_handler
-    _langchain_callback_handler = tracer.get_langchain_callback_handler()
+
+    if LANGCHAIN_INSTALLED:
+        _langchain_callback_handler = tracer.get_langchain_callback_handler()
 
     try:
         tracer.trace_run(

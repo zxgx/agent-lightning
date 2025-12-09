@@ -1,6 +1,6 @@
 [project]
 name = "agentlightning"
-version = "0.2.2"
+version = "0.3.0"
 description = "Agent-lightning is the absolute trainer to light up AI agents."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,7 @@ dependencies = [
   "portpicker",
   "gunicorn",
   "uvicorn_worker",
+  "aiologic",
 ]
 
 [project.optional-dependencies]
@@ -35,7 +36,12 @@ apo = [
 # though it's listed here for completeness.
 verl = [
   "verl>=0.5.0",
-  "vllm>=0.8.4,<0.11.0", # Due to interface change of ExternalZeroMQDistributedExecutor
+  "vllm>=0.8.4", # Due to interface change of ExternalZeroMQDistributedExecutor
+]
+
+# Store-related dependencies.
+mongo = [
+  "pymongo",
 ]
 
 [project.scripts]
@@ -60,6 +66,7 @@ dev = [
   "mkdocs-git-authors-plugin",
   "mkdocs-macros-plugin",
   "mkdocs-autorefs",
+  "prometheus-client",
 ]
 experiment = [
   "random-word",
@@ -92,8 +99,12 @@ torch-stable = [
   # This can work for both CPU and GPU.
   "torch>=2.8.0",
   "torchvision>=0.23.0",
-  "transformers>=4.55.0",
-  "vllm>=0.10.2",
+  # https://github.com/huggingface/transformers/issues/42369
+  "transformers>=4.55.0,!=4.57.2",
+  # vLLM 0.11.1 requires PyTorch 2.9.0, which is incompatible with flash-attn
+  # https://github.com/Dao-AILab/flash-attention/issues/1967
+  # Similar issues with vLLM 0.11.2 and 0.12.0
+  "vllm>=0.10.2,!=0.11.1,!=0.11.2,!=0.12.0",
   # LiteLLM can then be upgraded with new vLLM
   "litellm[proxy]>=1.78",
 ]
@@ -161,7 +172,7 @@ autogen = [
 ]
 openai-agents = [
   "openai-agents",
-  "openai<2.7.0",
+  "openai",
   # Compatibility issues with the latest version of OpenAI, temporarily fixed version
   # Issue: https://github.com/openai/openai-agents-python/issues/2038
   "mcp",
@@ -172,31 +183,42 @@ anthropic = [
   "anthropic",
 ]
 langchain = [
-  "langgraph<1.0",
-  "langchain[openai]<1.0",
-  "langchain-community",
-  "langchain-text-splitters<1.0",
+  "langgraph>=1.0.0",
+  "langchain[openai]>=1.0.0",
+  "langchain-community>=0.4.0",
+  "langchain-text-splitters>=1.0.0",
 ]
 sql = [
   "sqlparse",
   "nltk",
 ]
+rag = [
+  "fastmcp>=2.13.1",
+  "faiss-cpu>=1.11.0",
+  "sentence-transformers>=4.1.0",
+]
 crewai = [
-  "crewai[tools]>=1.2.0",
+  # https://github.com/crewAIInc/crewAI/issues/3959
+  "crewai[tools]>=1.2.0,!=1.2.1,!=1.3.0,!=1.4.0,!=1.4.1,!=1.5.0",
+]
+swebench = [
+  "swebench",
 ]
 
 # Summarize into large installable groups.
+# Note: langchain is excluded from agents to avoid conflicts with torch-legacy.
+# Use --group langchain explicitly when needed.
 agents = [
   {include-group = "autogen"},
   {include-group = "openai-agents"},
-  {include-group = "langchain"},
   {include-group = "sql"},
   {include-group = "anthropic"},
   {include-group = "crewai"},
+  {include-group = "swebench"},
 ]
 
 [tool.uv]
-required-version = ">=0.9.4"
+required-version = ">=0.9.9"
 conflicts = [
   [
     { group = "core-legacy" },
@@ -208,6 +230,12 @@ conflicts = [
   ],
   [
     { group = "torch-stable" },
+    { group = "torch-legacy" },
+  ],
+  # langchain >= 1.0 requires openai >= 1.109.1 (via langchain-openai),
+  # but torch-legacy uses vllm==0.9.2 which requires openai<=1.90.0
+  [
+    { group = "langchain" },
     { group = "torch-legacy" },
   ],
 ]
@@ -226,6 +254,12 @@ override-dependencies = [
   "uvicorn>=0.38.0",
   # Conflicts between packaging dependency of pyvers (dependency of tensordict) and agentops.
   "packaging>=24.0",
+  # Conflicts between litellm and fastmcp
+  "websockets>=15.0.1",
+  "rich>=13.9.4",
+  # verl's numpy<2.0.0 constraint is related to Docker images, not code incompatibility
+  # Lock to 2.3.0 because numba relies on numpy 2.2
+  "numpy>=2.0.0,<2.3.0",
 ]
 
 [tool.uv.sources]
@@ -233,7 +267,7 @@ torch = [
   { index = "pytorch-cu128", group = "torch-cu128" },
   { index = "pytorch-cpu", group = "torch-cpu" },
 ]
-tinker_cookbook = { git = "https://github.com/thinking-machines-lab/tinker-cookbook", rev = "72ba5e6a1f52c0887e2674615e318ce21a39cc2a" }
+tinker_cookbook = { git = "https://github.com/thinking-machines-lab/tinker-cookbook" }
 
 [[tool.uv.index]]
 name = "pypi"
@@ -282,6 +316,13 @@ exclude = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "openai: tests that require OpenAI API",
+  "gpu: tests that require GPU",
+  "agentops: tests that require AgentOps",
+  "llmproxy: tests that require LiteLLM",
+  "mongo: tests that require MongoDB",
+]
 
 [tool.black]
 line-length = 120

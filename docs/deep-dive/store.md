@@ -117,7 +117,7 @@ rollout = await store.enqueue_rollout(input, config=cfg)
 | ------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | N/A                                   | `queuing`                                 | Created by `enqueue_rollout()`.                                                                   |
 | `preparing`                           | `queuing/requeuing` → `preparing`         | Typically `dequeue_rollout()` or `start_rollout()`/`start_attempt()` creates a new attempt.       |
-| `running`                             | `preparing/queuing/requeuing` → `running` | First `add_[otel_]span()` flips the attempt to `running`; rollout follows via `propagate_status`. |
+| `running`                             | `preparing/queuing/requeuing` → `running` | First `add_[otel_]span()` flips the attempt to `running`; rollout follows via `rollout_status_from_attempt`. |
 | `succeeded`                           | `*` → `succeeded`                         | Terminal. Rollout `end_time` set.                                                                 |
 | `failed` / `timeout` / `unresponsive` | `*` → `requeuing`                         | **Only if** `status ∈ retry_condition ∧ sequence_id < max_attempts`.                              |
 | `failed` / `timeout` / `unresponsive` | `*` → `failed`                            | Otherwise (no retries left or retries disabled).                                                  |
@@ -125,7 +125,7 @@ rollout = await store.enqueue_rollout(input, config=cfg)
 
 !!! note "Why aggregation?"
 
-    In code, we use `propagate_status()` which actively updates the rollout based on the latest attempt. Reading the table above is usually easier than reverse-engineering the propagation logic in the code: think of the rollout’s transitions as *callbacks* on attempt state changes, plus queue/cancel paths.
+    In code, we use `rollout_status_from_attempt()` which actively updates the rollout based on the latest attempt. Reading the table above is usually easier than reverse-engineering the propagation logic in the code: think of the rollout’s transitions as *callbacks* on attempt state changes, plus queue/cancel paths.
 
 ## Spans
 
@@ -152,6 +152,13 @@ Programmatically this is encapsulated by [`Span.from_opentelemetry(readable_span
 
     [`add_span`][agentlightning.LightningStore.add_span] or [`add_otel_span`][agentlightning.LightningStore.add_otel_span] both appends a span *and* acts as a heartbeat that can revive `unresponsive` → `running`.
 
+## OTLP Compatibility
+
+Some of the LightningStore implementations support exporting traces via the [OTLP/HTTP specification](https://opentelemetry.io/docs/specs/otlp/). For example, [`LightningStoreServer`][agentlightning.LightningStoreServer] exposes `/v1/traces` endpoint, it implements the binary Protobuf variant defined by the spec, including the required `Content-Type: application/x-protobuf`, optional `Content-Encoding: gzip`, and status responses encoded as `google.rpc.Status`. Agent-lightning helps parsing `ExportTraceServiceRequest` messages, validate identifiers, normalize resource metadata, and allocate sequence
+numbers so store implementations only need to persist [`Span`][agentlightning.Span] objects in order.
+
+Because the interface speaks standard OTLP, any OpenTelemetry-compatible SDK or collector can emit spans directly to a LightningStore OTLP endpoint without custom shims. The server responds according to the OTLP contract (status code, encoding, and error payloads), which keeps Agent-lightning interoperable with existing observability tooling. This compatibility serves as a strong complement to the OpenTelemetry conversion discussed above.
+
 ## Store Implementations
 
 Currently, the only out-of-the-box implementation is [`InMemoryLightningStore`][agentlightning.InMemoryLightningStore]:
@@ -161,6 +168,8 @@ Currently, the only out-of-the-box implementation is [`InMemoryLightningStore`][
 - Includes a best-effort span eviction policy once memory crosses a configured watermark; querying evicted spans raises a clear error so callers can fall back.
 
 For production you will likely want persistence. We’re actively building a SQLite-backed store that keeps the same API surface while adding durability, crash recovery, and better historical span queries. If you need something sooner, implement your own store by subclassing [`LightningStore`][agentlightning.LightningStore] and providing concrete storage for the small set of abstract methods (`enqueue_rollout`, `dequeue_rollout`, `update_attempt`, `add_span`, etc.). This document plus the tests in `tests/store/` illustrate the expected behavior.
+
+Different store implementations may have different capabilities. For example, [`InMemoryLightningStore`][agentlightning.InMemoryLightningStore] does not support exporting traces via OTLP. Try to distinguish the capabilities of a store implementation by checking the [`capabilities`][agentlightning.LightningStore.capabilities] property.
 
 ## Thread Safety
 
@@ -196,7 +205,7 @@ await server.start()      # starts uvicorn in a daemon thread and waits for /hea
 # Client (same or different process)
 client = agl.LightningStoreClient("http://localhost:4747")
 
-print(await client.query_rollouts(status=["queuing"]))
+print(await client.query_rollouts(status_in=["queuing"]))
 
 await client.close()
 await server.stop()

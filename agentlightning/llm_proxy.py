@@ -40,11 +40,14 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.opentelemetry import OpenTelemetry, OpenTelemetryConfig
 from litellm.proxy.proxy_server import app, save_worker_config  # pyright: ignore[reportUnknownVariableType]
 from litellm.types.utils import CallTypes
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import Scope
 
+from agentlightning.semconv import LightningResourceAttributes
 from agentlightning.types import LLM, ProxyLLM
 from agentlightning.utils.server_launcher import (
     LaunchMode,
@@ -172,6 +175,24 @@ class AddReturnTokenIds(CustomLogger):
         return {**data, "return_token_ids": True}
 
 
+class AddLogprobs(CustomLogger):
+    """LiteLLM logger hook to request logprobs from vLLM.
+
+    This mutates the outgoing request payload to include `logprobs=1`
+    for backends that support logprobs return (e.g., vLLM).
+    """
+
+    async def async_pre_call_hook(self, *args: Any, **kwargs: Any) -> Optional[Union[Exception, str, Dict[str, Any]]]:
+        """Async pre-call hook to adjust request payload."""
+        try:
+            data = _get_pre_call_data(args, kwargs)
+        except Exception as e:
+            return e
+
+        # Ensure logprobs are requested from the backend when supported.
+        return {**data, "logprobs": 1}
+
+
 class LightningSpanExporter(SpanExporter):
     """Buffered OTEL span exporter with subtree flushing and training-store sink.
 
@@ -192,7 +213,7 @@ class LightningSpanExporter(SpanExporter):
     def __init__(self, _store: Optional[LightningStore] = None):
         self._store: Optional[LightningStore] = _store  # this is only for testing purposes
         self._buffer: List[ReadableSpan] = []
-        self._lock: Optional[threading.RLock] = None
+        self._lock: Optional[threading.Lock] = None
         self._loop_lock_pid: Optional[int] = None
 
         # Single dedicated event loop running in a daemon thread.
@@ -200,6 +221,8 @@ class LightningSpanExporter(SpanExporter):
         # Deferred creation until first use.
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
+
+        self._otlp_exporter = OTLPSpanExporter()
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         """Lazily initialize the event loop and thread on first use.
@@ -214,15 +237,15 @@ class LightningSpanExporter(SpanExporter):
             self._loop_thread.start()
         return self._loop
 
-    def _ensure_lock(self) -> threading.RLock:
+    def _ensure_lock(self) -> threading.Lock:
         """Lazily initialize the lock on first use.
 
         Returns:
-            threading.RLock: The initialized lock.
+            threading.Lock: The initialized lock.
         """
         self._clear_loop_and_lock()
         if self._lock is None:
-            self._lock = threading.RLock()
+            self._lock = threading.Lock()
         return self._lock
 
     def _clear_loop_and_lock(self) -> None:
@@ -284,24 +307,18 @@ class LightningSpanExporter(SpanExporter):
         with self._ensure_lock():
             for span in spans:
                 self._buffer.append(span)
-
-        # Run the async flush on our private loop, synchronously from caller's POV.
-        async def _locked_flush():
-            # Take the lock inside the coroutine to serialize with other flushes.
-            with self._ensure_lock():
-                return await self._maybe_flush()
-
-        try:
-            loop = self._ensure_loop()
-            fut = asyncio.run_coroutine_threadsafe(_locked_flush(), loop)
-            fut.result()  # Bubble up any exceptions from the coroutine.
-        except Exception as e:
-            logger.exception("Export flush failed: %s", e)
-            return SpanExportResult.FAILURE
+            default_endpoint = self._otlp_exporter._endpoint  # pyright: ignore[reportPrivateUsage]
+            try:
+                self._maybe_flush()
+            except Exception as e:
+                logger.exception("Export flush failed: %s", e)
+                return SpanExportResult.FAILURE
+            finally:
+                self._otlp_exporter._endpoint = default_endpoint  # pyright: ignore[reportPrivateUsage]
 
         return SpanExportResult.SUCCESS
 
-    async def _maybe_flush(self):
+    def _maybe_flush(self):
         """Flush ready subtrees from the buffer.
 
         Strategy:
@@ -323,10 +340,19 @@ class LightningSpanExporter(SpanExporter):
             if not subtree_spans:
                 continue
 
+            # Store is initialized lazily here in most cases.
             store = self._store or get_active_llm_proxy().get_store()
             if store is None:
                 logger.warning("Store is not set in LLMProxy. Cannot log spans to store.")
                 continue
+
+            # If the store supports OTLP endpoint, use it.
+            if store.capabilities.get("otlp_traces", False):
+                otlp_traces_endpoint = store.otlp_traces_endpoint()
+                self._otlp_exporter._endpoint = otlp_traces_endpoint  # pyright: ignore[reportPrivateUsage]
+                otlp_enabled = True
+            else:
+                otlp_enabled = False
 
             # Merge all custom headers found in the subtree.
             headers_merged: Dict[str, Any] = {}
@@ -383,10 +409,34 @@ class LightningSpanExporter(SpanExporter):
             sequence_id_decimal = int(sequence_id)
 
             # Persist each span in the subtree with the resolved identifiers.
-            for span in subtree_spans:
-                await store.add_otel_span(
-                    rollout_id=rollout_id, attempt_id=attempt_id, sequence_id=sequence_id_decimal, readable_span=span
-                )
+            if otlp_enabled:
+                # If store has OTLP support, directly use OTLP exporter and export in batch
+                for span in subtree_spans:
+                    span._resource = span._resource.merge(  # pyright: ignore[reportPrivateUsage]
+                        Resource.create(
+                            {
+                                LightningResourceAttributes.ROLLOUT_ID.value: rollout_id,
+                                LightningResourceAttributes.ATTEMPT_ID.value: attempt_id,
+                                LightningResourceAttributes.SPAN_SEQUENCE_ID.value: sequence_id_decimal,
+                            }
+                        )
+                    )
+                export_result = self._otlp_exporter.export(subtree_spans)
+                if export_result != SpanExportResult.SUCCESS:
+                    raise RuntimeError(f"Failed to export spans via OTLP exporter. Result: {export_result}")
+
+            else:
+                # The old way: store does not support OTLP endpoint
+                for span in subtree_spans:
+                    loop = self._ensure_loop()
+                    add_otel_span_task = store.add_otel_span(
+                        rollout_id=rollout_id,
+                        attempt_id=attempt_id,
+                        sequence_id=sequence_id_decimal,
+                        readable_span=span,
+                    )
+                    fut = asyncio.run_coroutine_threadsafe(add_otel_span_task, loop)
+                    fut.result()  # Bubble up any exceptions from the coroutine.
 
     def _get_root_span_ids(self) -> Iterable[int]:
         """Yield span_ids for root spans currently in the buffer.
@@ -822,7 +872,6 @@ class StreamConversionMiddleware(BaseHTTPMiddleware):
         )  # e.g., "stop", "length", "tool_calls", "content_filter"
 
         def sse_chunk(obj: Dict[str, Any]) -> str:
-            print("sse_chunk: ", obj)
             return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
         # 1) initial chunk with the role
@@ -950,6 +999,7 @@ _MIDDLEWARE_REGISTRY: Dict[str, Type[BaseHTTPMiddleware]] = {
 
 _CALLBACK_REGISTRY = {
     "return_token_ids": AddReturnTokenIds,
+    "logprobs": AddLogprobs,
     "opentelemetry": LightningOpenTelemetry,
 }
 
@@ -1008,7 +1058,7 @@ class LLMProxy:
             Middlewares are the **first layer** of request processing. They are applied to all requests before the LiteLLM proxy.
         callbacks: List of LiteLLM callback classes or strings to register. You can specify the class aliases or classes that have been imported.
             If not provided, the default callbacks (AddReturnTokenIds and LightningOpenTelemetry) will be used.
-            Available callback aliases are: "return_token_ids", "opentelemetry".
+            Available callback aliases are: "return_token_ids", "opentelemetry", "logprobs".
     """
 
     def __init__(
@@ -1022,8 +1072,8 @@ class LLMProxy:
         num_workers: int = 1,
         launch_mode: LaunchMode = "mp",
         launcher_args: PythonServerLauncherArgs | None = None,
-        middlewares: List[Union[Type[BaseHTTPMiddleware], str]] | None = None,
-        callbacks: List[Union[Type[CustomLogger], str]] | None = None,
+        middlewares: Sequence[Union[Type[BaseHTTPMiddleware], str]] | None = None,
+        callbacks: Sequence[Union[Type[CustomLogger], str]] | None = None,
     ):
         self.store = store
 
@@ -1129,6 +1179,9 @@ class LLMProxy:
         if _global_llm_proxy is not None:
             logger.warning("A global LLMProxy is already set. Overwriting it with the new instance.")
 
+        # Patch for LiteLLM v1.80.6+: https://github.com/BerriAI/litellm/issues/17243
+        os.environ["USE_OTEL_LITELLM_REQUEST_SPAN"] = "true"
+
         # Set the global LLMProxy reference for middleware/exporter access.
         set_active_llm_proxy(self)
 
@@ -1209,16 +1262,16 @@ class LLMProxy:
         if self.store is None:
             raise ValueError("Store is not set. Please set the store before starting the LLMProxy.")
 
-        store_capabilities = self.store.capabilities()
-        if self.server_launcher.args.launch_mode == "mp" and not store_capabilities["zero_copy"]:
+        store_capabilities = self.store.capabilities
+        if self.server_launcher.args.launch_mode == "mp" and not store_capabilities.get("zero_copy", False):
             raise RuntimeError(
                 "The store does not support zero-copy. Please use another store, or use asyncio or thread mode to launch the server."
             )
-        elif self.server_launcher.args.launch_mode == "thread" and not store_capabilities["thread_safe"]:
+        elif self.server_launcher.args.launch_mode == "thread" and not store_capabilities.get("thread_safe", False):
             raise RuntimeError(
                 "The store is not thread-safe. Please use another store, or use asyncio mode to launch the server."
             )
-        elif self.server_launcher.args.launch_mode == "asyncio" and not store_capabilities["async_safe"]:
+        elif self.server_launcher.args.launch_mode == "asyncio" and not store_capabilities.get("async_safe", False):
             raise RuntimeError("The store is not async-safe. Please use another store.")
 
         logger.info(

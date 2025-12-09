@@ -17,6 +17,7 @@ from agentlightning.types import (
     Attempt,
     AttemptedRollout,
     AttemptStatus,
+    EnqueueRolloutRequest,
     NamedResources,
     OtelResource,
     ResourcesUpdate,
@@ -177,9 +178,11 @@ async def test_threaded_store_delegates_all_methods() -> None:
         "get_resources_by_id": resources_update,
         "get_latest_resources": resources_update,
         "add_span": span,
+        "add_many_spans": [span],
         "add_otel_span": span,
         "wait_for_rollouts": [base_rollout],
         "get_next_span_sequence_id": 42,
+        "get_many_span_sequence_ids": [101],
         "query_spans": [span],
         "update_rollout": updated_rollout,
         "update_attempt": updated_attempt,
@@ -211,9 +214,11 @@ async def test_threaded_store_delegates_all_methods() -> None:
     assert await threaded_store.get_resources_by_id("resources-1") == resources_update
     assert await threaded_store.get_latest_resources() == resources_update
     assert await threaded_store.add_span(span) == span
+    assert await threaded_store.add_many_spans([span]) == [span]
     assert await threaded_store.add_otel_span(rollout_id, attempt_id, readable_span, sequence_id=5) == span
     assert await threaded_store.wait_for_rollouts(rollout_ids=[rollout_id], timeout=1.0) == [base_rollout]
     assert await threaded_store.get_next_span_sequence_id(rollout_id, attempt_id) == 42
+    assert await threaded_store.get_many_span_sequence_ids([(rollout_id, attempt_id)]) == [101]
     assert await threaded_store.query_spans(rollout_id, attempt_id="latest") == [span]
     assert (
         await threaded_store.update_rollout(
@@ -254,9 +259,11 @@ async def test_threaded_store_delegates_all_methods() -> None:
         "get_resources_by_id",
         "get_latest_resources",
         "add_span",
+        "add_many_spans",
         "add_otel_span",
         "wait_for_rollouts",
         "get_next_span_sequence_id",
+        "get_many_span_sequence_ids",
         "query_spans",
         "update_rollout",
         "update_attempt",
@@ -265,6 +272,42 @@ async def test_threaded_store_delegates_all_methods() -> None:
         "update_worker",
     ]
     assert [name for name, *_ in dummy_store.calls] == expected_order
+
+
+@pytest.mark.asyncio
+async def test_threaded_store_enqueue_many_rollouts_delegates() -> None:
+    requests = [
+        EnqueueRolloutRequest(input={"idx": 0}, mode="train", metadata={"batch": "left"}),
+        EnqueueRolloutRequest(input={"idx": 1}, mode=None, resources_id="resources-1"),
+    ]
+    rollouts = [
+        Rollout(rollout_id="bulk-0", input={"idx": 0}, start_time=0.0),
+        Rollout(rollout_id="bulk-1", input={"idx": 1}, start_time=1.0),
+    ]
+    dummy_store = DummyLightningStore({"enqueue_many_rollouts": rollouts})
+    threaded_store = LightningStoreThreaded(dummy_store)
+
+    result = await threaded_store.enqueue_many_rollouts(requests)
+    assert result == rollouts
+    assert dummy_store.calls[-1][0] == "enqueue_many_rollouts"
+    assert dummy_store.calls[-1][1][0] == requests
+
+
+@pytest.mark.asyncio
+async def test_threaded_store_dequeue_many_rollouts_delegates() -> None:
+    attempt_a = Attempt(rollout_id="bulk-0", attempt_id="attempt-0", sequence_id=1, start_time=0.0)
+    attempt_b = Attempt(rollout_id="bulk-1", attempt_id="attempt-1", sequence_id=1, start_time=0.0)
+    attempts = [
+        AttemptedRollout(rollout_id="bulk-0", input={"idx": 0}, start_time=0.0, attempt=attempt_a),
+        AttemptedRollout(rollout_id="bulk-1", input={"idx": 1}, start_time=0.0, attempt=attempt_b),
+    ]
+    dummy_store = DummyLightningStore({"dequeue_many_rollouts": attempts})
+    threaded_store = LightningStoreThreaded(dummy_store)
+
+    result = await threaded_store.dequeue_many_rollouts(limit=2, worker_id="thread-worker")
+    assert result == attempts
+    assert dummy_store.calls[-1][0] == "dequeue_many_rollouts"
+    assert dummy_store.calls[-1][2] == {"limit": 2, "worker_id": "thread-worker"}
 
 
 def test_threaded_store_serializes_update_attempt_calls() -> None:
@@ -359,3 +402,28 @@ def test_threaded_store_serializes_add_resources_calls() -> None:
     assert len(updates) == num_adds
     resource_ids = {update.resources_id for update in updates}
     assert len(resource_ids) == num_adds  # All IDs should be unique
+
+
+@pytest.mark.asyncio
+async def test_threaded_store_statistics_match_underlying(inmemory_store: InMemoryLightningStore) -> None:
+    """Threaded store should proxy statistics from wrapped store."""
+    rollout = await inmemory_store.start_rollout(input={"source": "threaded-stats"})
+    await inmemory_store.add_span(make_span(rollout.rollout_id, rollout.attempt.attempt_id))
+    await inmemory_store.add_resources(
+        {
+            "threaded_llm": LLM(
+                resource_type="llm",
+                endpoint="http://localhost:9000/v1",
+                model="threaded-model",
+            )
+        }
+    )
+    await inmemory_store.update_worker("threaded-worker", heartbeat_stats={"cpu": 0.1})
+
+    threaded_store = LightningStoreThreaded(inmemory_store)
+    threaded_stats = await threaded_store.statistics()
+    inmemory_stats = await inmemory_store.statistics()
+    assert {k: v for k, v in threaded_stats.items() if k != "uptime"} == {
+        k: v for k, v in inmemory_stats.items() if k != "uptime"
+    }
+    assert threaded_stats["uptime"] < inmemory_stats["uptime"]  # type: ignore

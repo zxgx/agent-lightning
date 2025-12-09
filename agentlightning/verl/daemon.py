@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Mapping
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, cast
 
 import numpy as np
 import requests
@@ -18,13 +18,11 @@ from flask import Flask, Response, abort, request
 from tensordict import TensorDict
 from verl import DataProto
 
-from agentlightning import LLM, AgentLightningServer, NamedResources, RolloutLegacy, configure_logger
+from agentlightning import LLM, AgentLightningServer, NamedResources, RolloutLegacy
 from agentlightning.adapter.triplet import TracerTraceToTriplet, TraceToTripletBase
 from agentlightning.llm_proxy import LLMProxy, ModelConfig
 from agentlightning.store.base import LightningStore
-from agentlightning.types import Rollout, RolloutConfig, Task
-
-configure_logger()
+from agentlightning.types import EnqueueRolloutRequest, Rollout, RolloutConfig, Task
 
 __all__ = [
     "AgentModeDaemon",
@@ -379,42 +377,57 @@ class AgentModeDaemon:
         num_samples = len(data[keys[0]])
         rollouts_per_sample = self.train_rollout_n if is_train else 1
 
+        enqueue_rollout_requests: List[EnqueueRolloutRequest] = []
+        data_id_to_original_sample: Dict[str, Dict[str, Any]] = {}
+
         for i in range(num_samples):
             data_id = str(uuid.uuid4())
             original_sample = {key: data[key][i] for key in keys}
             original_sample["data_id"] = data_id
+            data_id_to_original_sample[data_id] = original_sample
 
             # For training, each sample is rolled out multiple times
+            # Data ID is different from Rollout ID, as one data can have multiple rollouts.
             for _ in range(rollouts_per_sample):
                 task_metadata = {"data_id": data_id, "is_train": is_train}
-
-                # Data ID is different from Rollout ID, as one data can have multiple rollouts.
                 if self.mode == "v0":
+                    # Queue immediately
                     rollout_id = await self.server.queue_task(
                         sample=_to_native(original_sample),
                         mode="train" if is_train else "val",
                         resources_id=resources_id,
                         metadata=task_metadata,
                     )
-                else:
-                    rollout = await self.store.enqueue_rollout(
-                        input=_to_native(original_sample),
-                        mode="train" if is_train else "val",
-                        resources_id=resources_id,
-                        metadata=task_metadata,
-                    )
-                    await self.store.update_rollout(
-                        rollout_id=rollout.rollout_id,
-                        config=RolloutConfig(
-                            unresponsive_seconds=self.llm_timeout_seconds,
-                            timeout_seconds=self.llm_timeout_seconds,
-                        ),
-                    )
-                    rollout_id = rollout.rollout_id
 
-                # Store original sample data to reconstruct batch information later
-                self._task_id_to_original_sample[rollout_id] = original_sample
-                self._total_tasks_queued += 1
+                    # Store original sample data to reconstruct batch information later
+                    self._task_id_to_original_sample[rollout_id] = original_sample
+                    self._total_tasks_queued += 1
+                else:
+                    # Collect tasks to enqueue in batch and queue them later
+                    enqueue_rollout_requests.append(
+                        EnqueueRolloutRequest(
+                            input=_to_native(original_sample),
+                            mode="train" if is_train else "val",
+                            resources_id=resources_id,
+                            config=RolloutConfig(
+                                unresponsive_seconds=self.llm_timeout_seconds,
+                                timeout_seconds=self.llm_timeout_seconds,
+                            ),
+                            metadata=task_metadata,
+                        )
+                    )
+
+        if self.mode == "v1":
+            # Enqueue all the tasks in a single batch
+            rollouts = await self.store.enqueue_many_rollouts(enqueue_rollout_requests)
+            self._task_id_to_original_sample.update(
+                {
+                    # Recover the original data and store it for later use.
+                    rollout.rollout_id: data_id_to_original_sample[cast(Dict[str, Any], rollout.metadata)["data_id"]]
+                    for rollout in rollouts
+                }
+            )
+            self._total_tasks_queued += len(rollouts)
 
     def set_up_data_and_server(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True):
         """Synchronous wrapper for setting up data and server resources."""
@@ -559,14 +572,17 @@ class AgentModeDaemon:
         )  # FIXME: Evaluate whether grouping stats by source is actually needed.
 
         for rollout_id, rollout in self._completed_rollouts_v0.items():
+            final_reward_raw: Optional[float] = rollout.final_reward
             final_reward = self._fillna_reward(rollout)
             if not rollout.triplets:
                 print(f"Warning: No triplets found for test rollout {rollout.rollout_id}.")
-                sample_stat_list.append({"reward": final_reward})
+                sample_stat_list.append({"reward": final_reward, "has_reward": final_reward_raw is not None})
                 continue
             response_length_list = [len(triplet.response.get("token_ids", [])) for triplet in rollout.triplets]
+
             if "data_source" in self._task_id_to_original_sample[rollout_id]:
                 # When a test sample includes a 'data_source' field, record per-source statistics for test results.
+                # TODO: This is a flawed design. We should have a better way to handle this.
                 data_source = self._task_id_to_original_sample[rollout_id]["data_source"]
                 sample_stat_list_by_source[data_source].append(
                     {
@@ -574,6 +590,7 @@ class AgentModeDaemon:
                         "mean_response_length": np.mean(response_length_list) if response_length_list else 0,
                         "turn_count": len(rollout.triplets),
                         "reward": final_reward,
+                        "has_reward": final_reward_raw is not None,
                     }
                 )
             sample_stat_list.append(
@@ -582,6 +599,7 @@ class AgentModeDaemon:
                     "mean_response_length": np.mean(response_length_list) if response_length_list else 0,
                     "turn_count": len(rollout.triplets),
                     "reward": final_reward,
+                    "has_reward": final_reward_raw is not None,
                 }
             )
         metric_dict: Dict[str, Any] = {}
@@ -596,6 +614,9 @@ class AgentModeDaemon:
                 {
                     f"val/{data_source}/n_rollouts": len(sample_stats),
                     f"val/{data_source}/n_rollouts_w_trace": len(stats_w_trace_by_source[data_source]),
+                    f"val/{data_source}/n_rollouts_w_reward": len(
+                        [stat for stat in sample_stats if stat["has_reward"]]
+                    ),
                     f"val/{data_source}/reward": np.mean(
                         [stat["reward"] for stat in sample_stats]
                     ),  # each rollout must have a reward (fillna if missing)
@@ -614,6 +635,7 @@ class AgentModeDaemon:
             {
                 "val/n_rollouts": len(sample_stat_list),
                 "val/n_rollouts_w_trace": len(stats_w_trace),
+                "val/n_rollouts_w_reward": len([stat for stat in sample_stat_list if stat["has_reward"]]),
                 "val/reward": np.mean(
                     [stat["reward"] for stat in sample_stat_list]
                 ),  # each rollout must have a reward (fillna if missing)
@@ -638,9 +660,10 @@ class AgentModeDaemon:
         # 1. Reconstruct the `finished_id_to_sample_info` structure from completed rollouts
         finished_id_to_sample_info: Dict[str, Dict[str, Any]] = {}
         finished_id_to_final_reward: Dict[str, float] = {}
+        sample_with_reward_count = 0
         for rollout_id, rollout in self._completed_rollouts_v0.items():
             original_sample = self._task_id_to_original_sample[rollout_id]
-
+            sample_with_reward_count += int(rollout.final_reward is not None)
             final_reward = self._fillna_reward(rollout)
 
             if not rollout.triplets:
@@ -759,6 +782,7 @@ class AgentModeDaemon:
             "training/reward": np.mean(list(finished_id_to_final_reward.values())),
             "training/n_rollouts": len(finished_id_to_final_reward),
             "training/n_rollouts_w_trace": len(finished_id_to_sample_info),
+            "training/n_rollouts_w_reward": sample_with_reward_count,
             "training/n_truncated_triplets": n_trunc_sample_because_of_response,
             "training/n_triplets": n_transition,
         }
