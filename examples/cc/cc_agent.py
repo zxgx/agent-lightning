@@ -90,6 +90,7 @@ class CodingAgent(LitAgent):
     ) -> RolloutRawResult:
         run_id = f"epoch_{task.get('epoch', 0)}"
         image = f"{self.namespace}/sweb.eval.x86_64.{task['instance_id'].lower()}".replace("__", "_1776_")
+        reward = 0.0
 
         llm = resources.get("llm")
         assert llm is not None, "LLM resource is required for rollout."
@@ -115,9 +116,9 @@ class CodingAgent(LitAgent):
             del controller
         except Exception as e:
             logger(run_id, task["instance_id"], f"Exception during rollout: {e}")
+            return reward
 
         # 3. obtain rewards (evaluation result)
-        reward = 0.0
         # empty patch
         if prediction["model_patch"] in ["", None]:
             return reward
