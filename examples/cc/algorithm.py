@@ -193,7 +193,7 @@ async def build_dataset(
             f"Rewards are: {[t.reward for t in triplets]}"
         )
 
-        if triplets[-1].reward is not None:
+        if triplets and triplets[-1].reward is not None:
             task_result.append(triplets[-1].reward)
 
         # Converts the triplets to a HuggingFace Dataset
