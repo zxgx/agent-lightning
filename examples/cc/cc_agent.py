@@ -133,7 +133,7 @@ class CodingAgent(LitAgent):
             run_id,
             self.timeout,
             namespace=self.namespace,
-            instance_image_tag=self.instance_image_tag
+            instance_image_tag=self.instance_image_tag,
         )
 
         # error patch

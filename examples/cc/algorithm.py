@@ -177,7 +177,7 @@ async def build_dataset(
     if span_dump_path:
         spand_dump_epoch_path = os.path.join(span_dump_path, f"epoch_{epoch}")
         os.makedirs(spand_dump_epoch_path, exist_ok=True)
-    
+
     task_result = []
     for rollout in completed_rollouts:
         # Use data_adapter to adapt the spans to triplets. Triplets are a list of Pydantic models:
@@ -192,7 +192,7 @@ async def build_dataset(
             f"Prompt lengths: {prompt_lengths}. Response lengths: {response_lengths}. "
             f"Rewards are: {[t.reward for t in triplets]}"
         )
-        
+
         if triplets[-1].reward is not None:
             task_result.append(triplets[-1].reward)
 
@@ -243,7 +243,7 @@ async def build_dataset(
     console.print(
         f"[bold red][Algo][/bold red] Epoch {epoch} averaged reward {sum(task_result)/len(task_result) if task_result else 0.0}"
     )
-    
+
     if len(all_triplets) == 0:
         raise ValueError("No triplets to train on.")
 

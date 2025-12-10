@@ -3,10 +3,11 @@ from functools import partial
 from typing import Literal
 
 import dotenv
-from utils.reward import RewardEstimatorWholeSlice
 from utils.docker_runtime import Runtime
 from utils.logger import logger
-from utils.type import CC_ALL_TOOLS as all_tools, AgentResult, ClaudeCodeStep, ClaudeCodeTraj
+from utils.reward import RewardEstimatorWholeSlice
+from utils.type import CC_ALL_TOOLS as all_tools
+from utils.type import AgentResult, ClaudeCodeStep, ClaudeCodeTraj
 
 
 class ClaudeController:
@@ -124,16 +125,13 @@ fi
             "trajectory": traj,
         }
         return return_value
-    
-    def calculate_intermediate_rewards_per_slice(self, 
-                                       gold_patch: str,
-                                       model_patch: str, 
-                                       reproduction_file: str, 
-                                       trajectory: ClaudeCodeTraj) -> list[tuple[ClaudeCodeStep, float]]:
-        reward_estimator: RewardEstimatorWholeSlice = RewardEstimatorWholeSlice(self.container,
-                                                                                reproduction_file,
-                                                                                model_patch, 
-                                                                                gold_patch)
+
+    def calculate_intermediate_rewards_per_slice(
+        self, gold_patch: str, model_patch: str, reproduction_file: str, trajectory: ClaudeCodeTraj
+    ) -> list[tuple[ClaudeCodeStep, float]]:
+        reward_estimator: RewardEstimatorWholeSlice = RewardEstimatorWholeSlice(
+            self.container, reproduction_file, model_patch, gold_patch
+        )
         return reward_estimator.main(trajectory)
 
     def __del__(self):

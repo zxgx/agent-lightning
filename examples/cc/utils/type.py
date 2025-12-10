@@ -84,8 +84,8 @@ class AgentResult(SWEbenchInput):
     trajectory: ClaudeCodeTraj
     reproduction_file: str
 
+
 class TrajSlice(TypedDict):
     process: SliceType
     step_range: tuple[int, int]
     content: ClaudeCodeTraj
-

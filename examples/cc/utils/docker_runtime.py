@@ -20,9 +20,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-import docker
 from docker.models.containers import Container
 from typing_extensions import Self
+
+import docker
 
 CMD_OUTPUT_PS1_BEGIN = "\n###PS1JSON###\n"
 CMD_OUTPUT_PS1_END = "\n###PS1END###"
