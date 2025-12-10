@@ -94,7 +94,7 @@ if __name__ == "__main__":
         port=args.proxy_port, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs, AddTemperature]
     )
     if args.access_host is not None:
-        llm_proxy.server_launcher.args.access_host = args.access_host
+        llm_proxy.server_launcher._access_host = args.access_host
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)  # type: ignore
 

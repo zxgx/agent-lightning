@@ -3,7 +3,7 @@ from functools import partial
 from typing import Literal
 
 import dotenv
-from examples.cc.utils.reward import RewardEstimator, RewardEstimatorWholeSlice
+from utils.reward import RewardEstimatorWholeSlice
 from utils.docker_runtime import Runtime
 from utils.logger import logger
 from utils.type import CC_ALL_TOOLS as all_tools, AgentResult, ClaudeCodeStep, ClaudeCodeTraj

@@ -32,7 +32,7 @@ export HF_HOME=$HOME/.cache/huggingface
 # Make it able to receive named cmd args, --model_tag, --tool_call_parser, --num_samples
 model_tag=Qwen/Qwen3-4B-Instruct-2507
 tool_call_parser=hermes
-num_repeats=2
+num_repeats=1
 dataset_path=swe_debug.jsonl
 
 # Parse command line arguments
