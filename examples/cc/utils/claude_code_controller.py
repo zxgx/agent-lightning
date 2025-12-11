@@ -35,7 +35,7 @@ class ClaudeController:
             log_function=partial(logger, run_id=self.run_id, instance_id=instance["instance_id"]),
             platform="linux",
         )
-        container.send_command("curl -fsSL https://claude.ai/install.sh | bash")
+        container.send_command("curl -fsSL https://claude.ai/install.sh | bash -s -- 2.0.65")
         container.send_command('alias claude="$HOME/.local/bin/claude"')
         dotenv.load_dotenv()
         # anthropic_api_key = os.getenv('ANTHROPIC_API_KEY')
