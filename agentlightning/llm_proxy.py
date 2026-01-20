@@ -308,11 +308,11 @@ class LightningSpanExporter(SpanExporter):
             for span in spans:
                 from opentelemetry.trace import format_span_id
 
-                print(
-                    f">>> [SPAN] {span.name} {format_span_id(span.context.span_id)} "
-                    f"(parent: {format_span_id(span.parent.span_id) if span.parent is not None else 'N/A'}) "
-                    f"{[key for key in span.attributes.keys() if not key.startswith('llm.request.functions') and not key.startswith('gen_ai.prompt')]}"
-                )
+                # print(
+                #     f">>> [SPAN] {span.name} {format_span_id(span.context.span_id)} "
+                #     f"(parent: {format_span_id(span.parent.span_id) if span.parent is not None else 'N/A'}) "
+                #     f"{[key for key in span.attributes.keys() if not key.startswith('llm.request.functions') and not key.startswith('gen_ai.prompt')]}"
+                # )
                 self._buffer.append(span)
             default_endpoint = self._otlp_exporter._endpoint  # pyright: ignore[reportPrivateUsage]
             try:
@@ -528,9 +528,9 @@ class LightningOpenTelemetry(OpenTelemetry):
         """The root span is sometimes missing (e.g., when Anthropic endpoint is used).
         It is created in an auth module in LiteLLM. If it's missing, we create it here.
         """
-        print(">>> kwargs keys:", kwargs.keys())
+        # print(">>> kwargs keys:", kwargs.keys())
         headers = kwargs.get("headers", kwargs.get("proxy_server_request", {}).get("headers", {}))
-        print(">>> headers:", headers)
+        # print(">>> headers:", headers)
 
         if "metadata" not in kwargs or "litellm_parent_otel_span" not in kwargs["metadata"]:
             parent_otel_span = self.create_litellm_proxy_request_started_span(  # type: ignore
@@ -549,7 +549,7 @@ class LightningOpenTelemetry(OpenTelemetry):
             metadata.setdefault("requester_custom_headers", custom_headers)
             for key, value in metadata.items():
                 self.safe_set_attribute(span=parent_otel_span, key="metadata.{}".format(key), value=value)
-            print(f">>> [METADATA] {metadata}")
+            # print(f">>> [METADATA] {metadata}")
 
             updated_metadata = {**metadata, "litellm_parent_otel_span": parent_otel_span}
 
