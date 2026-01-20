@@ -91,7 +91,10 @@ if __name__ == "__main__":
 
     store = LightningStoreClient(args.store_address)
     llm_proxy = LLMProxy(
-        port=args.proxy_port, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs, AddTemperature]
+        port=args.proxy_port,
+        store=store,
+        callbacks=["return_token_ids", "opentelemetry", AddLogprobs, AddTemperature],
+        litellm_config={"general_settings": {"forward_client_headers_to_llm_api": True}},
     )
     if args.access_host is not None:
         llm_proxy.server_launcher._access_host = args.access_host

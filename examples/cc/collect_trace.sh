@@ -28,7 +28,7 @@
 # Qwen/Qwen3-4B-Instruct-2507 - hermes
 
 export NCCL_DEBUG=WARN
-export HF_HOME=$HOME/.cache/huggingface
+# export HF_HOME=$HOME/.cache/huggingface
 
 
 # Make it able to receive named cmd args, --model_tag, --tool_call_parser, --num_samples
@@ -37,6 +37,7 @@ tool_call_parser=hermes
 num_repeats=1
 dataset_path=swe_debug.jsonl
 
+rm -rf /mnt/input/agl_trace/debug
 output_dir=/mnt/input/agl_trace/debug
 mkdir -p $output_dir
 
