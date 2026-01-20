@@ -443,7 +443,9 @@ async def test_anthropic_token_ids(qwen25_model: RemoteOpenAIServer, otlp_enable
     try:
         resource, rollout = await _new_resource(proxy, store)
         adapter = LlmProxyTraceToTriplet()
-        client = anthropic.Anthropic(base_url=resource.endpoint, api_key="token-abc123", timeout=120)
+        client = anthropic.Anthropic(
+            base_url=resource.endpoint, api_key="token-abc123", timeout=120, default_headers={"x-test": "test"}
+        )
 
         # non-stream
         response = client.messages.create(
@@ -487,6 +489,9 @@ async def test_anthropic_token_ids(qwen25_model: RemoteOpenAIServer, otlp_enable
                 assert "llm.hosted_vllm.choices" in span.attributes
             if span.name == "litellm_request":
                 assert "gen_ai.completion.0.content" in span.attributes
+            if span.name == "Received Proxy Server Request":
+                assert "metadata.requester_custom_headers" in span.attributes
+                assert "x-test" in span.attributes["metadata.requester_custom_headers"]  # type: ignore
         assert len(spans) > 0
         triplets = adapter.adapt(spans)
         for i, triplet in enumerate(triplets):
