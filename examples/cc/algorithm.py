@@ -7,7 +7,7 @@ import socket
 import subprocess
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from cc_agent import flatten_messages, load_dataset
@@ -160,6 +160,72 @@ async def run_rollout(
         return completed_rollouts
 
 
+async def process_rollout(
+    rollout: Rollout,
+    store: LightningStore,
+    data_adapter: LlmProxyTraceToTriplet,
+    tokenizer: AutoTokenizer,
+    spand_dump_epoch_path: Optional[str],
+) -> Tuple[List[Dict[str, Any]], Optional[float]]:
+    """Process a single rollout and return triplets and task result"""
+    triplets_data = []
+    task_result = None
+
+    # Use data_adapter to adapt the spans to triplets
+    spans = await store.query_spans(rollout.rollout_id)
+    triplets = data_adapter.adapt(spans)
+
+    # Logging the prompt and response lengths and rewards for debugging
+    prompt_lengths = [len(t.prompt["token_ids"]) if t.prompt["token_ids"] else 0 for t in triplets]
+    response_lengths = [len(t.response["token_ids"]) if t.response["token_ids"] else 0 for t in triplets]
+    console.print(
+        f"[bold red][Algo][/bold red] Rollout {rollout.rollout_id} has {len(spans)} spans, yielding {len(triplets)} triplets. "
+        f"Prompt lengths: {prompt_lengths}. Response lengths: {response_lengths}. "
+        f"Rewards are: {[t.reward for t in triplets]}"
+    )
+
+    if triplets and triplets[-1].reward is not None:
+        task_result = triplets[-1].reward
+
+    # Converts the triplets to a HuggingFace Dataset
+    recent_reward: Optional[float] = None
+    for triplet in reversed(triplets):
+        if triplet.reward is not None:
+            recent_reward = triplet.reward
+
+        if recent_reward is None:
+            console.print(
+                f"[bold red][Algo][/bold red] Recent reward is None for triplet {triplet}. "
+                "Skip adding to SFT training data."
+            )
+            continue
+
+        prompt = tokenizer.decode(triplet.prompt["token_ids"])  # type: ignore
+        triplets_data.append(
+            {
+                "repo": rollout.input["repo"],
+                "instance_id": rollout.input["instance_id"],
+                "turn": triplet.metadata["sequence_id"],
+                "prompt_ids": triplet.prompt["token_ids"],
+                "gold_completion_ids": triplet.response["token_ids"],
+                "logprobs": triplet.response["logprobs"],
+                "reward": recent_reward,
+                "prompt": prompt,
+                "messages": flatten_messages(triplet.metadata["messages"]),
+            }
+        )
+
+    if spand_dump_epoch_path:
+        span_file_path = os.path.join(
+            spand_dump_epoch_path, f"{rollout.input['instance_id']}-{rollout.rollout_id}.json"
+        )
+        with open(span_file_path, "w") as f:
+            for span in spans:
+                f.write(json.dumps(span.model_dump()) + "\n")
+
+    return triplets_data, task_result
+
+
 async def build_dataset(
     completed_rollouts: List[Rollout],
     store: LightningStore,
@@ -178,62 +244,20 @@ async def build_dataset(
         spand_dump_epoch_path = os.path.join(span_dump_path, f"epoch_{epoch}")
         os.makedirs(spand_dump_epoch_path, exist_ok=True)
 
+    # Process all rollouts in parallel
+    results = await asyncio.gather(
+        *[
+            process_rollout(rollout, store, data_adapter, tokenizer, spand_dump_epoch_path)
+            for rollout in completed_rollouts
+        ]
+    )
+
+    # Collect results
     task_result = []
-    for rollout in completed_rollouts:
-        # Use data_adapter to adapt the spans to triplets. Triplets are a list of Pydantic models:
-        spans = await store.query_spans(rollout.rollout_id)
-        triplets = data_adapter.adapt(spans)
-
-        # Logging the prompt and response lengths and rewards for debugging
-        prompt_lengths = [len(t.prompt["token_ids"]) if t.prompt["token_ids"] else 0 for t in triplets]
-        response_lengths = [len(t.response["token_ids"]) if t.response["token_ids"] else 0 for t in triplets]
-        console.print(
-            f"[bold red][Algo][/bold red] Rollout {rollout.rollout_id} has {len(spans)} spans, yielding {len(triplets)} triplets. "
-            f"Prompt lengths: {prompt_lengths}. Response lengths: {response_lengths}. "
-            f"Rewards are: {[t.reward for t in triplets]}"
-        )
-
-        if triplets and triplets[-1].reward is not None:
-            task_result.append(triplets[-1].reward)
-
-        # Converts the triplets to a HuggingFace Dataset
-        # NOTE:
-        # - multiprocesses to speed up;
-        # - maybe customize reward for each triple in the future
-        recent_reward: Optional[float] = None
-        for triplet in reversed(triplets):
-            if triplet.reward is not None:
-                recent_reward = triplet.reward
-
-            if recent_reward is None:
-                console.print(
-                    f"[bold red][Algo][/bold red] Recent reward is None for triplet {triplet}. "
-                    "Skip adding to SFT training data."
-                )
-                continue
-
-            prompt = tokenizer.decode(triplet.prompt["token_ids"])  # type: ignore
-            all_triplets.append(
-                {
-                    "repo": rollout.input["repo"],
-                    "instance_id": rollout.input["instance_id"],
-                    "turn": triplet.metadata["sequence_id"],
-                    "prompt_ids": triplet.prompt["token_ids"],
-                    "gold_completion_ids": triplet.response["token_ids"],
-                    "logprobs": triplet.response["logprobs"],
-                    "reward": recent_reward,
-                    "prompt": prompt,
-                    "messages": flatten_messages(triplet.metadata["messages"]),
-                }
-            )
-
-        if spand_dump_epoch_path:
-            span_file_path = os.path.join(
-                spand_dump_epoch_path, f"{rollout.input['instance_id']}-{rollout.rollout_id}.json"
-            )
-            with open(span_file_path, "w") as f:
-                for span in spans:
-                    f.write(json.dumps(span.model_dump()) + "\n")
+    for triplets_data, reward in results:
+        all_triplets.extend(triplets_data)
+        if reward is not None:
+            task_result.append(reward)
 
     if len(task_result) < len(completed_rollouts):
         console.print(
