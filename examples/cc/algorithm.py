@@ -166,14 +166,16 @@ async def process_rollout(
     data_adapter: LlmProxyTraceToTriplet,
     tokenizer: AutoTokenizer,
     spand_dump_epoch_path: Optional[str],
+    semaphore: asyncio.Semaphore,
 ) -> Tuple[List[Dict[str, Any]], Optional[float]]:
     """Process a single rollout and return triplets and task result"""
     triplets_data = []
     task_result = None
 
-    # Use data_adapter to adapt the spans to triplets
-    spans = await store.query_spans(rollout.rollout_id)
-    triplets = data_adapter.adapt(spans)
+    async with semaphore:
+        # Use data_adapter to adapt the spans to triplets
+        spans = await store.query_spans(rollout.rollout_id)
+        triplets = data_adapter.adapt(spans)
 
     # Logging the prompt and response lengths and rewards for debugging
     prompt_lengths = [len(t.prompt["token_ids"]) if t.prompt["token_ids"] else 0 for t in triplets]
@@ -235,6 +237,7 @@ async def build_dataset(
     train_triplet_fraction: float,
     dataset_dump_path: str,
     span_dump_path: Optional[str] = None,
+    max_concurrent_requests: int = 4,  # set to 16 will cause asyncio timeout error when querying store.
 ) -> str:
     """Prepare the dataset for training"""
     all_triplets: List[Dict[str, Any]] = []
@@ -244,10 +247,12 @@ async def build_dataset(
         spand_dump_epoch_path = os.path.join(span_dump_path, f"epoch_{epoch}")
         os.makedirs(spand_dump_epoch_path, exist_ok=True)
 
+    semaphore = asyncio.Semaphore(max_concurrent_requests)
+
     # Process all rollouts in parallel
     results = await asyncio.gather(
         *[
-            process_rollout(rollout, store, data_adapter, tokenizer, spand_dump_epoch_path)
+            process_rollout(rollout, store, data_adapter, tokenizer, spand_dump_epoch_path, semaphore)
             for rollout in completed_rollouts
         ]
     )

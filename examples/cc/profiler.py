@@ -3,10 +3,12 @@ import json
 import math
 import multiprocessing
 import os
+from collections import defaultdict
 from datetime import datetime
 from functools import partial
 from typing import Dict, List
 
+import numpy as np
 from tqdm import tqdm
 
 
@@ -66,8 +68,8 @@ class SpanAnalyzer:
             end_tick = int(end_offset / tick_duration)
 
             map_line = ["-"] * num_ticks
-            for t in range(start_tick, min(end_tick + 1, num_ticks)):
-                map_line[t] = "X"
+            for t in range(min(start_tick, num_ticks - 1), min(end_tick + 1, num_ticks)):
+                map_line[t] = span["model_group"][0].upper()
             maps.append("".join(map_line))
 
             meta = {
@@ -93,16 +95,69 @@ class SpanAnalyzer:
         return tick_duration, total_duration
 
     def dump(self, save_path=None, verbose=False, tick_duration=1.0, total_duration=0.0):
+        ############################
+        # LLM Call Timeline
         results = "Section: LLM Call Timeline in order\n"
         results += f"Tick Duration: {tick_duration:.2f} s | Total Duration: {total_duration:.2f} s\n"
+        results += f"S: Sonnet | H: Haiku | R: Reward | -: Idle\n"
         for maps, meta in zip(self.map, self.meta):
-            results += f"{'S-' + str(meta['sequence_id']).zfill(3):>5}: [{maps}] | Type: {meta['type']:<15} | Duration: {meta['duration']:6.2f} s"
+            results += f"{'S-' + str(meta['sequence_id']).zfill(3):>5}: [{maps}] | Type: {meta['type']:<18} | Duration: {meta['duration']:6.2f} s"
             if meta["type"] != "reward":
                 results += f" | Prompt Len: {meta['prompt_len']:6} | Response Len: {meta['response_len']:6} | Throughput: {meta['throughput']:7.2f} tok/s"
             else:
                 results += f" | Reward: {meta['reward']}"
             results += "\n"
 
+        ############################
+        # Tool Call Statistics
+        results += "\n\n\nSection: Tool call statistics\n"
+        found_tool_calls, pending_tool_calls = [], {}
+        for idx, span in enumerate(self.spans[:-1]):
+            model_group = span["model_group"]
+            cur_tool_calls = span["response"]["tool_calls"]
+
+            # Tool calls are handled only by Sonnet
+            if model_group != "sonnet":
+                continue
+
+            # pending new tool calls
+            if cur_tool_calls:
+                for each in cur_tool_calls:
+                    assert each["id"] not in pending_tool_calls, f"Tool call {each['id']} is already pending."
+                    pending_tool_calls[each["id"]] = idx
+
+            # finalize finished tool calls
+            if span["prompt"][-1]["role"] == "tool":
+                tool_call_id = span["prompt"][-1]["tool_call_id"]
+                assert (
+                    tool_call_id in pending_tool_calls
+                ), f"Tool call {tool_call_id} at turn {idx}'s prompt is not pending."
+
+                start_idx = pending_tool_calls.pop(tool_call_id)
+                start_span = self.spans[start_idx]
+                found_tool_calls.append(
+                    {
+                        "tool_name": start_span["response"]["tool_calls"][0]["function"]["name"],
+                        "time_cost": (span["start_time"] - start_span["end_time"]).total_seconds(),
+                    }
+                )
+
+        tool_stat_dict = defaultdict(list)
+        for call in found_tool_calls:
+            tool_stat_dict[call["tool_name"]].append(call["time_cost"])
+
+        for tool_name, time_costs in tool_stat_dict.items():
+            avg_time = sum(time_costs) / len(time_costs)
+            results += f"Tool: {tool_name:<20} | Num Calls: {len(time_costs):3} | Avg Time Cost: {avg_time:6.2f} s\n"
+
+        results += f"Pending Tool Calls: {len(pending_tool_calls)}\n"
+        for call_id, span_idx in pending_tool_calls.items():
+            results += (
+                f"  - Tool Call ID: {call_id} | Started at Span S-{str(self.spans[span_idx]['sequence_id']).zfill(3)}\n"
+            )
+
+        ############################
+        # Proxy Cost Summary
         results += "\n\n\nSection: Proxy Cost Summary\n"
         for meta in self.meta:
             if meta["type"] == "reward":
@@ -112,11 +167,29 @@ class SpanAnalyzer:
             )
             results += f" | End Proxy Cost: {meta['end_proxy_cost']:4.2f} s | Total Proxy Cost (%): {meta['proxy_cost (%)']:5.2f} %\n"
 
+        ############################
+        # Conversation logs
+        results += "\n\n\nSection: Raw Entries (excluding reward entry)\n"
+        raw_entries = [
+            {
+                "sequence_id": entry["sequence_id"],
+                "model_group": entry["model_group"],
+                "start_time": entry["start_time"],
+                "end_time": entry["end_time"],
+                "prompt": entry["prompt"],
+                "response": entry["response"],
+            }
+            for entry in self.spans[:-1]
+        ]
+        results += json.dumps(raw_entries, default=str, indent=2)
+
         if save_path:
             with open(save_path, "w") as f:
                 f.write(results)
         if verbose:
             print(results)
+
+        return found_tool_calls
 
 
 def worker_func(instance_span_path, span_dir, save_dir, verbose, num_ticks):
@@ -132,6 +205,17 @@ def worker_func(instance_span_path, span_dir, save_dir, verbose, num_ticks):
             for line in f:
                 spans.append(json.loads(line))
 
+        span_seq_dict = defaultdict(list)
+        for span in spans:
+            span_seq_dict[span["sequence_id"]].append(span)
+
+        new_spans = []
+        for seq_id in sorted(span_seq_dict.keys()):
+            seq_spans = span_seq_dict[seq_id]
+            if len(seq_spans) == 4 or (len(seq_spans) == 1 and seq_spans[0]["name"] == "agentlightning.annotation"):
+                new_spans.extend(seq_spans)
+        spans = new_spans
+
         # Each request consists of 4 spans
         assert len(spans) % 4 == 1, f"Span count {len(spans)} is not in expected format."
 
@@ -143,7 +227,9 @@ def worker_func(instance_span_path, span_dir, save_dir, verbose, num_ticks):
                 span_idx = idx + offset
                 span = spans[span_idx]
 
-                assert sequence_id == span["sequence_id"]
+                assert (
+                    sequence_id == span["sequence_id"]
+                ), f"Sequence ID mismatch at offset {offset}: {sequence_id} vs {span['sequence_id']}"
 
                 st = datetime.fromtimestamp(span["start_time"])
                 et = datetime.fromtimestamp(span["end_time"])
@@ -162,6 +248,14 @@ def worker_func(instance_span_path, span_dir, save_dir, verbose, num_ticks):
                     # - prompt_token_ids
                     # - response_token_ids
                     new_entry.update(adapt_raw_gen_ai_request_span(span))
+                if span["name"] == "Received Proxy Server Request":
+                    model_group = span["attributes"].get("metadata.model_group", "x").lower()
+                    if "sonnet" in model_group.lower():
+                        new_entry["model_group"] = "sonnet"
+                    elif "haiku" in model_group.lower():
+                        new_entry["model_group"] = "haiku"
+                    else:
+                        new_entry["model_group"] = "x"
 
             assert len(new_entry) > 0, f"Failed to adapt spans at offset {offset} in file {instance_span_path}"
 
@@ -219,34 +313,22 @@ def worker_func(instance_span_path, span_dir, save_dir, verbose, num_ticks):
                 "end_time": datetime.fromtimestamp(span["end_time"]),
                 "reward": reward_value,
                 "sequence_id": span["sequence_id"],
+                "model_group": "Reward",
             }
         )
 
         # Analyze and Save
         analyzer = SpanAnalyzer(collected_entries, num_ticks=num_ticks)
         tick_duration, total_duration = analyzer.analyse()
-        analyzer.dump(save_path=save_path, verbose=verbose, tick_duration=tick_duration, total_duration=total_duration)
+        found_tool_calls = analyzer.dump(
+            save_path=save_path, verbose=verbose, tick_duration=tick_duration, total_duration=total_duration
+        )
 
-        if save_path:
-            with open(save_path, "a") as f:
-                f.write("\n\n\nSection: Raw Entries (excluding reward entry)\n")
-
-                filtered_entries = [
-                    {
-                        "sequence_id": entry["sequence_id"],
-                        "start_time": entry["start_time"],
-                        "end_time": entry["end_time"],
-                        "prompt": entry["prompt"],
-                        "response": entry["response"],
-                    }
-                    for entry in collected_entries[:-1]
-                ]
-
-                json.dump(filtered_entries, f, default=str, indent=2)
-
-        return True
+        return found_tool_calls
     except Exception as e:
-        return f"Error processing {instance_span_path}: {e}"
+        exception_type = type(e).__name__
+        exception_message = str(e)
+        return f"Error processing {instance_span_path}: [{exception_type}] {exception_message}"
 
 
 def main(args):
@@ -271,6 +353,18 @@ def main(args):
         )
 
     assert len(results) == len(instance_span_paths), "Some span files were not processed."
+
+    tool_stat_dict = defaultdict(list)
+    for res in results:
+        if isinstance(res, list):
+            for tool_call in res:
+                tool_stat_dict[tool_call["tool_name"]].append(tool_call["time_cost"])
+    print("\n\nOverall Tool Call Statistics:")
+    for tool_name, time_costs in tool_stat_dict.items():
+        print(
+            f"Tool: {tool_name} | Num Calls: {len(time_costs)} | Min: {np.min(time_costs):.2f} s - Max: {np.max(time_costs):.2f} s | Average: {np.mean(time_costs):.2f} s, Std: {np.std(time_costs):.2f} s"
+        )
+
     # Check for errors in results
     errors = [r for r in results if isinstance(r, str)]
     if errors:
