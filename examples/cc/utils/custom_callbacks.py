@@ -31,7 +31,7 @@ class AddLogprobs(CustomLogger):
         return {**data, "logprobs": 1}
 
 
-class AddTemperature(CustomLogger):
+class AddGreedySamplingParams(CustomLogger):
     """LiteLLM logger hook to request logprobs from vLLM.
 
     This mutates the outgoing request payload to include `logprobs=1`
@@ -54,4 +54,4 @@ class AddTemperature(CustomLogger):
             return e
 
         # Ensure logprobs are requested from the backend when supported.
-        return {**data, "temperature": 1.0}
+        return {**data, "temperature": 0.0, "top_p": 1.0}

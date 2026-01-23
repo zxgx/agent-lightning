@@ -270,7 +270,7 @@ async def build_dataset(
             f"{len(completed_rollouts)} rollouts."
         )
     console.print(
-        f"[bold red][Algo][/bold red] Epoch {epoch} averaged reward {sum(task_result)/len(completed_rollouts) if completed_rollouts else 0.0}"
+        f"[bold red][Algo][/bold red] Epoch {epoch} averaged reward {sum(task_result)/len(completed_rollouts) if completed_rollouts else 0.0} in {len(completed_rollouts)} rollouts."
     )
 
     if len(all_triplets) == 0:

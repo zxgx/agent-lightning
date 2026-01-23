@@ -15,7 +15,7 @@ from swebench.harness.utils import load_swebench_dataset
 from transformers import AutoTokenizer as AutoProcessor
 from utils.claude_code_controller import ClaudeController
 from utils.custom_adapter import LlmProxyTraceToAugmentedTriplet
-from utils.custom_callbacks import AddLogprobs, AddTemperature
+from utils.custom_callbacks import AddGreedySamplingParams, AddLogprobs
 from utils.evaluation import evaluate
 from utils.logger import logger
 from utils.type import AgentResult, ClaudeCodeStep
@@ -223,7 +223,7 @@ async def cc_agent_dry_run_sample(
     adapter = LlmProxyTraceToAugmentedTriplet()
     store = LightningStoreServer(InMemoryLightningStore(), host="0.0.0.0", port=7654)
     llm_proxy = LLMProxy(
-        port=12358, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs, AddTemperature]
+        port=12358, store=store, callbacks=["return_token_ids", "opentelemetry", AddLogprobs, AddGreedySamplingParams]
     )
 
     await store.start()
