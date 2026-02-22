@@ -54,4 +54,5 @@ class AddGreedySamplingParams(CustomLogger):
             return e
 
         # Ensure logprobs are requested from the backend when supported.
-        return {**data, "temperature": 0.0, "top_p": 1.0}
+        # return {**data, "temperature": 0.0, "top_p": 1.0}
+        return {**data, "temperature": 1.0}
